@@ -1,0 +1,18 @@
+# Чтобы подключиться, используя обычного пользователя (и позже повысить права до root через sudo),
+# замените `ansible_ssh_user=root` на что-то вроде этого: `ansible_ssh_user=username ansible_become=true ansible_become_user=root`.
+# Если sudo требует пароль, либо добавьте `ansible_become_password=PASSWORD_HERE` в строку хоста,
+# либо укажите Ansible запрашивать пароль интерактивно, добавив флаг `--ask-become-pass` (`-K`) ко всем командам `ansible-playbook` (или `just`).
+#
+# Для повышения производительности Ansible по умолчанию в `ansible.cfg` включен SSH pipelining.
+# Если это вызывает проблемы с SSH-соединением, отключите его, добавив `ansible_ssh_pipelining=False`
+# в строку хоста ниже или добавив `ansible_ssh_pipelining: False` в ваш файл переменных.
+#
+# Если вы запускаете этот Ansible-плейбук на том же сервере, на который выполняется установка,
+# рассмотрите возможность добавления дополнительного аргумента `ansible_connection=local` в строку хоста ниже.
+#
+# Ansible может не определить автоматически, какой интерпретатор Python использовать на хосте в некоторых дистрибутивах (например, Ubuntu 20.04).
+# Иногда может потребоваться явно добавить аргумент `ansible_python_interpreter=/usr/bin/python3`
+# в строку хоста ниже.
+
+[matrix_servers]
+ВАШ_МАТРИКС_ДОМЕН ansible_host=IP_МАТРИКС_СЕРВЕРА ansible_port=22 ansible_user=root

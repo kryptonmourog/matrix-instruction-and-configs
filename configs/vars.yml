@@ -1,0 +1,152 @@
+---
+
+your_ip: "185.56.162.10"                                         # ВСТАВИТЬ IP СВОЕГО СЕРВЕРА
+your_proxy_http_proxy: "http://172.17.0.1:10809"
+your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-authentication-service,matrix-postgres,matrix-exim-relay,172.16.0.0/12"
+
+matrix_domain: testertest-srv12345.ru                            # ВСТАВИТЬ СВОЙ ОСНОВНОЙ ДОМЕН
+matrix_server_fqn_matrix: "mat.{{ matrix_domain }}"              # ВСТАВИТЬ свой домен для MATRIX
+coturn_hostname: "turn.{{ matrix_domain }}"                      # ВСТАВИТЬ свой домен для COTURN (старые звонки, 1-на-1)
+matrix_element_call_hostname: "elementcall.{{ matrix_domain }}"  # ВСТАВИТЬ свой домен для Element Call (современные звонки + групповые)
+ntfy_hostname: "p.{{ matrix_domain }}"                           # ВСТАВИТЬ свой домен для NTFY (уведомления)
+matrix_element_admin_hostname: "admin.{{ matrix_domain }}"       # ВСТАВИТЬ свой домен для Element Admin
+matrix_server_fqn_element: "elem.{{ matrix_domain }}"            # ВСТАВИТЬ свой домен для Web Client (Element Web)
+
+
+
+# Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
+matrix_well_known_matrix_client_enabled: true
+# Для федерации
+matrix_static_files_container_labels_base_domain_enabled: true
+
+
+# обратный прокси - traefik - дефолт для этого ansible playbook
+matrix_playbook_reverse_proxy_type: playbook-managed-traefik
+traefik_config_certificatesResolvers_acme_email: '' # ВСТАВИТЬ EMAIL ДЛЯ ИНФОРМАЦИИ ОБ SSL СЕРТИФИКАТОВ ОТ  LET'S ENCRYPT
+
+devture_systemd_docker_base_ipv6_enabled: true
+devture_systemd_service_manager_up_verification_delay_seconds: 45
+
+matrix_homeserver_implementation: synapse
+matrix_homeserver_generic_secret_key: '' # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ (`pwgen -s 64 1`)
+postgres_connection_password: '' # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ (`pwgen -s 64 1`)
+
+# (Если у вас сервер - Synapse и не используется MAS, то настраиваем это на true)
+# true Включает возможность самостоятельной регистрации
+matrix_synapse_enable_registration: false
+# Капча (требует доп. настройки поставщика капчи)
+matrix_synapse_enable_registration_captcha: false
+# Разрешает регистрационные токены Synapse (у MAS свои токены и настройка для них)
+matrix_synapse_registration_requires_token: false
+
+
+# Настройки прокси для synapse
+matrix_synapse_container_extra_arguments:
+  - "--env"
+  - "http_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  - "https_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  # Без прокси: все локальные адреса, ваши домены,
+  #  матрикс-контейнеры, которые могут общаться между собой по https (например Synapse <-> MAS) и все локальные адреса докера
+  - "no_proxy={{ your_proxy_no_proxy }}"
+  # Внутренний DNS докера
+  - "--dns"
+  - "127.0.0.11"
+
+matrix_synapse_configuration_extension_yaml: |
+  # Список комнат, в которые пользователь попадет сразу после регистрации
+  #auto_join_rooms:
+  #  - "#your-room:your-server.com"
+
+# Настраиваем ограничения сервера synapse чтобы не нагружать процессор огромными matrix-комнатами
+matrix_synapse_limit_remote_rooms_enabled: true
+matrix_synapse_limit_remote_rooms_complexity: 10.0
+matrix_synapse_limit_remote_rooms_complexity_error: "Наш сервер не может подключаться к таким большим/тяжелым комнатам."
+matrix_synapse_limit_remote_rooms_admins_can_join: false
+# Если false - Убирает опросы online/offline - важно при федерации, иначе CPU будет постоянно нагружен
+matrix_synapse_presence_enabled: false
+
+# Звонки p2p
+coturn_enabled: true
+coturn_turn_external_ip_addresses: ["{{ your_ip }}"]
+coturn_turn_static_auth_secret: "" # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ (`pwgen -s 64 1`)
+coturn_turn_udp_min_port: 49152
+coturn_turn_udp_max_port: 49652
+
+# Групповые звонки через Element Call (livekit)
+matrix_rtc_enabled: true
+matrix_element_call_enabled: true
+matrix_client_element_jitsi_preferred: false
+matrix_client_element_voip_conference_type: "livekit"
+# Принуждаем LiveKit работать корректно через TCP, если UDP блокируют
+livekit_server_config_turn_external_tls: true
+livekit_server_configuration_extension_yaml: |
+  rtc:
+    force_tcp: true
+
+# Если сервер не знает своего внешнего IP, пакеты застревают
+livekit_rtc_use_external_ip: true
+livekit_rtc_external_ip: "{{ your_ip }}"
+
+# ntfy для уведомлений
+ntfy_enabled: true
+
+# Админка synapse (доступ: *ваш хост*/synapse-admin )
+matrix_synapse_admin_enabled: false
+# Если включен MAS, то лучше использовать element_admin, а не synapse_admin
+matrix_element_admin_enabled: true
+
+# Настройка Matrix Authentication Service (MAS)
+matrix_authentication_service_enabled: true
+matrix_authentication_service_config_secrets_encryption: "" # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ (`openssl rand -hex 32`)
+# Если вы переносите авторизацию с обычного способа на MAS, то нужно поставить true
+matrix_authentication_service_migration_in_progress: false
+
+# Позволяет пользователям логиниться, используя email вместо username (удобно для сброса, но нужно настраивать отдельно)
+matrix_authentication_service_config_account_login_with_email_allowed: false
+# Включаем возможность регистрации по паролю, а не только через сторонних auth-поставщиков
+matrix_authentication_service_config_account_password_registration_enabled: true
+# Требовать токен для регистрации
+matrix_authentication_service_config_account_registration_token_required: true
+# Требовать email при регистрации
+matrix_authentication_service_config_account_password_registration_email_required: false
+
+# Позволяет пользователям самостоятельно Сбрасывать пароль по почте
+matrix_authentication_service_config_account_password_recovery_enabled: false
+# Позволяет пользователям самостоятельно Менять пароль в настройках
+matrix_authentication_service_config_account_password_change_allowed: true
+
+
+# Настройки прокси для MAS
+matrix_authentication_service_container_extra_arguments:
+  - "--env"
+  - "http_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  - "https_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  # Без прокси: все локальные адреса, ваши домены,
+  #  матрикс-контейнеры, которые могут общаться между собой по https (например Synapse <-> MAS) и все локальные адреса докера
+  - "no_proxy={{ your_proxy_no_proxy }}"
+  # Внутренний DNS докера
+  - "--dns"
+  - "127.0.0.11"
+
+
+# Web-client Element
+matrix_client_element_enabled: true
+# Стандартный телефонный код (+7)
+matrix_client_element_default_country_code: "RU"
+# Темы оформления из репозитория
+matrix_client_element_themes_enabled: true
+matrix_client_element_themes_repository_url: "https://github.com/aaronraimist/element-themes"
+# Включение сторонних тем по ссылке
+matrix_client_element_setting_defaults_custom_themes_enabled: true
+matrix_client_element_configuration_extension_json: |
+  {
+    "csp": {
+      "style-src": ["'self'", "'unsafe-inline'", "https://*"],
+      "img-src": ["'self'", "data:", "blob:", "https://*"],
+      "connect-src": ["'self'", "https://*", "wss://*"]
+    }
+  }

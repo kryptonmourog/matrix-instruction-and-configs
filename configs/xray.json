@@ -1,0 +1,198 @@
+{
+  "log": {
+    "loglevel": "info"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "port": 10808,
+      "listen": "0.0.0.0",
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": false,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "tag": "http-in",
+      "port": 10809,
+      "listen": "0.0.0.0",
+      "protocol": "http",
+      "settings": {
+        "enabled": true,
+        "allowTransparent": false
+      }
+    }
+  ],
+
+
+
+
+  "outbounds": [
+    {
+      "tag": "Personality-matrix_xray",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+// IP АДРЕС ВАШЕГО XRAY ПРОКСИ-СЕРВЕРА
+            "address": "",
+            "port": ,
+            "users": [
+              {
+// ВАШ USER ID (то что стоит после "vless://" и до "@ip.вашего.сервера")
+                "id": "",
+                // encryption
+                "encryption": "none",
+                // flow
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        // type
+        "network": "",
+        // security
+        "security": "",
+        "realitySettings": {
+          // pbk
+          "publicKey": "",
+          // fp
+          "fingerprint": "",
+          // sni
+          "serverName": "",
+          // sid
+          "shortId": "",
+          // spx
+          "spiderX": "/"
+        },
+        "xhttpSettings": {
+          // path
+          "path": "/",
+          "mode": "auto",
+          "extra": {
+            "noGRPCHeader": false
+          }
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+
+
+
+
+  "dns": {
+    "servers": [
+      // Приоритетный DNS для СНГ доменов (быстрый, без прокси)
+      {
+        "address": "77.88.8.8",     // DNS Яндекса
+        "port": 53,
+        "expectIPs": ["geoip:ru"],
+        "domains": [
+          "geosite:ru-available-only-inside",
+          "regexp:^.*\\.ru$",
+          "regexp:\\.su$",
+          "regexp:\\.kz$",
+          "regexp:\\.by$",
+          "regexp:\\.xn--p1acf$",    // .рус
+          "regexp:\\.xn--80adxhks$", // .москва
+          "regexp:\\.xn--p1ai$",     // .рф
+          "regexp:\\.xn--90ais$"     // .бел
+        ]
+      },
+      // Глобальные DNS для всего остального
+      {
+        "address": "1.1.1.1",     // DNS Cloudflare
+        "port": 53,
+        "domains": [] // "все остальные"
+      },
+      {
+        "address": "8.8.8.8",     // DNS Google
+        "port": 53,
+        "domains": [] // "все остальные"
+      }
+    ],
+    "queryStrategy": "UseIPv4"
+  },
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      // Локальный трафик - напрямую
+      {
+        "type": "field",
+        "ip": [
+          "geoip:private",
+          "172.16.0.0/12",
+          "10.0.0.0/8",
+          "127.0.0.0/8",
+          "fd42:f167:100f::/48"
+        ],
+        "outboundTag": "direct"
+      },
+      // Крупные зарубежные matrix-сервера - в прокси-сервер
+      {
+        "type": "field",
+        "domain": [
+          "matrix.org",          // Самый крупный узел
+          "element.io",          // Разработчики и их инфраструктура
+          "gitter.im",           // Мост с Gitter
+          "mozilla.org",         // Сообщество Mozilla
+          "kde.org",             // Сообщество KDE
+          "gnome.org",           // Сообщество GNOME
+          "t2l.io",              // Популярный хостинг ботов или мостов
+          "grin.hu",             // Популярный хостинг ботов или мостов
+          "fedora.im",           // Сообщество Fedora
+          "matrix.v.systems",    // Популярный азиатский узел
+          "modular.im"           // Хостинг для платных серверов
+        ],
+        "outboundTag": "Personality-matrix_xray"
+      },
+      // Российские IP - напрямую
+      {
+        "type": "field",
+        "ip": ["geoip:ru"],
+        "outboundTag": "direct"
+      },
+      // СНГ Домены - напрямую
+      {
+        "type": "field",
+        "domain": [
+          "geosite:ru-available-only-inside",
+          "regexp:^.*\\.ru$",
+          "regexp:\\.su$",
+          "regexp:\\.kz$",
+          "regexp:\\.by$",
+          "regexp:\\.xn--p1acf$",    // .рус
+          "regexp:\\.xn--80adxhks$", // .москва
+          "regexp:\\.xn--p1ai$",     // .рф
+          "regexp:\\.xn--90ais$"     // .бел
+        ],
+        "outboundTag": "direct"
+      },
+      // Всё остальное - в прокси-сервер
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "Personality-matrix_xray"
+      }
+    ]
+  }
+}
