@@ -17,6 +17,10 @@ read -r -p "Введите ваш Email для SSL-уведомлений (от 
 # Опрос пользователя касаемо XRAY vless/reality
 read -r -p "Ваш сервер находится в РФ и вам нужен Xray прокси? [y/N]: " NEED_XRAY
 
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
+    read -r -p "Введите вашу VLESS ссылку (vless://uuid@host:port?params...): " VLESS_LINK
+fi
+
 
 # Генерация случайных паролей
 GENERIC_SECRET=$(openssl rand -hex 32)
@@ -28,9 +32,17 @@ MAS_ENC_KEY=$(openssl rand -hex 32)
 sudo apt update && sudo apt upgrade -y
 sudo apt install curl git python3 python3-pip wget -y
 
+# Создание swap-файла
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+sudo sysctl vm.swappiness=10
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+
 # Настройка XRAY
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    read -r -p "Введите вашу VLESS ссылку (vless://uuid@host:port?params...): " VLESS_LINK
     # Парсинг VLESS ссылки
     # Убираем протокол
     VLESS_STR=${VLESS_LINK#vless://}
@@ -59,6 +71,8 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     V_SECURITY=$(get_vless_param "security")
     V_FLOW=$(get_vless_param "flow")
     V_SPX=$(get_vless_param "spx")
+
+
 
     # Установка и настройка Xray
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
@@ -147,14 +161,14 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
         "expectIPs": ["geoip:ru"],
         "domains": [
           "geosite:ru-available-only-inside",
-          "regexp:^.*\\.ru$",
-          "regexp:\\.su$",
-          "regexp:\\.kz$",
-          "regexp:\\.by$",
-          "regexp:\\.xn--p1acf$",    // .рус
-          "regexp:\\.xn--80adxhks$", // .москва
-          "regexp:\\.xn--p1ai$",     // .рф
-          "regexp:\\.xn--90ais$"     // .бел
+          "regexp:^.*\\\\.ru$",
+          "regexp:\\\\.su$",
+          "regexp:\\\\.kz$",
+          "regexp:\\\\.by$",
+          "regexp:\\\\.xn--p1acf$",    // .рус
+          "regexp:\\\\.xn--80adxhks$", // .москва
+          "regexp:\\\\.xn--p1ai$",     // .рф
+          "regexp:\\\\.xn--90ais$"     // .бел
         ]
       },
       // Глобальные DNS для всего остального
@@ -215,14 +229,14 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
         "type": "field",
         "domain": [
           "geosite:ru-available-only-inside",
-          "regexp:^.*\\.ru$",
-          "regexp:\\.su$",
-          "regexp:\\.kz$",
-          "regexp:\\.by$",
-          "regexp:\\.xn--p1acf$",    // .рус
-          "regexp:\\.xn--80adxhks$", // .москва
-          "regexp:\\.xn--p1ai$",     // .рф
-          "regexp:\\.xn--90ais$"     // .бел
+          "regexp:^.*\\\\.ru$",
+          "regexp:\\\\.su$",
+          "regexp:\\\\.kz$",
+          "regexp:\\\\.by$",
+          "regexp:\\\\.xn--p1acf$",    // .рус
+          "regexp:\\\\.xn--80adxhks$", // .москва
+          "regexp:\\\\.xn--p1ai$",     // .рф
+          "regexp:\\\\.xn--90ais$"     // .бел
         ],
         "outboundTag": "direct"
       },
@@ -238,7 +252,8 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 EOF
 
     sudo systemctl restart xray
-    sleep 5
+    echo "Ожидание перезапуска Xray..."
+    sleep 15
 
     # Экспортируем переменные для прокси в ТЕКУЩУЮ сессию скрипта
     export http_proxy="http://127.0.0.1:10809"
@@ -476,27 +491,39 @@ matrix_client_element_configuration_extension_json: |
   }
 EOF
 
-# 8. Запуск установки
+# Запуск установки
 echo "Запускаем установку Matrix. Это займет 10-20 минут..."
 ansible-playbook -i inventory/hosts setup.yml --tags=install-all,ensure-matrix-users-created,start
 
-# 9. Регистрация администратора
+# Регистрация администратора
 ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
 ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start
 
-printf "\n\n\nУстановка завершена!"
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 3478/tcp
+sudo ufw allow 3478/udp
+sudo ufw allow 5349/tcp
+sudo ufw allow 5349/udp
+sudo ufw allow 7880/tcp
+sudo ufw allow 7881/tcp
+sudo ufw allow 7882/udp
+sudo ufw allow 8448/tcp
+sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
+sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
+sudo ufw allow 49152:49652/udp
+sudo ufw enable
+
+printf "\n\n\n%s\n\n" "Установка завершена!"
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-  echo "Ваш XRAY конфиг доступен по пути:"
-  echo "    /usr/local/etc/xray/config.json"
+  printf "Ваш XRAY конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
 else
-  echo "Вы отказались от установки XRAY"
+  printf "Вы отказались от установки XRAY\n\n"
 fi
 
-echo "Ваш ansible конфиг доступен по пути:"
-echo "    ~/matrix-docker-ansible-deploy/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
-echo "Команда для повторного запуска ansible (если будете менять конфиг):"
-echo "    \`ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start\`"
-printf "\n\n"
-echo "Адрес вашего homeserver Matrix: $DOMAIN_MATRIX"
-echo "Адрес вашего web-клиента: $DOMAIN_WEB_CLIENT"
-echo "Адрес вашей админки: $DOMAIN_ADMIN_PANEL"
+printf "Ваш ansible конфиг доступен по пути:\n%s\n\n" "$HOME/matrix-docker-ansible-deploy/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+printf "Команда для повторного запуска ansible (если будете менять конфиг):\n%s\n\n" "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
+printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
+printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
