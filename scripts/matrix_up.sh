@@ -534,11 +534,10 @@ EOF
 
 # Запуск установки
 echo "Запускаем установку Matrix. Это займет ~30 минут..."
-ansible-playbook -i inventory/hosts setup.yml --tags=install-all,ensure-matrix-users-created,start
+ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
 
 # Регистрация администратора
 ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
-ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start
 
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
@@ -560,13 +559,18 @@ sudo ufw enable
 
 printf "\n\n\n%s\n\n" "Установка завершена!"
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-  printf "Ваш XRAY конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
+  printf "Ваш XRAY-конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
 else
   printf "Вы отказались от установки XRAY\n\n"
 fi
 
-printf "Ваш ansible конфиг доступен по пути:\n%s\n\n" "$HOME/matrix-docker-ansible-deploy/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+printf "Ваш ansible-конфиг доступен по пути:\n%s\n\n" "$HOME/matrix-docker-ansible-deploy/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
 printf "Команда для повторного запуска ansible (если будете менять конфиг):\n%s\n\n" "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
 printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
 printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
 printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
+printf "Никнейм админа:\n%s\n\n" "$ADMIN_NICK"
+printf "Пароль админа:\n%s\n\n" "$ADMIN_PASS"
+
+unset ADMIN_NICK
+unset ADMIN_PASS
