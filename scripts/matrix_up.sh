@@ -10,12 +10,12 @@ read -r -p "Поддомен для Coturn (например, turn.example.com):
 read -r -p "Поддомен для Element Call (например, call.example.com): " DOMAIN_CALL
 read -r -p "Поддомен для ntfy (сервис уведомлений) (например, ntfy.example.com): " DOMAIN_NTFY
 
-read -r -p "Введите желаемый логин для Админа Matrix: " ADMIN_NICK
-read -r -p "Введите желаемый пароль для Админа Matrix: " ADMIN_PASS
+read -r -p "Введите желаемый логин для Админа Matrix (в нижнем_регистре): " ADMIN_NICK
+read -r -p "Введите желаемый пароль для Админа Matrix (без восклицательных знаков): " ADMIN_PASS
 # Запрос email для SSL (Let's Encrypt)
 read -r -p "Введите ваш Email для SSL-уведомлений (от Let's Encrypt): " ADMIN_EMAIL
 # Опрос пользователя касаемо XRAY vless/reality
-read -r -p "Ваш сервер находится в РФ и вам нужен Xray прокси? [y/N]: " NEED_XRAY
+read -r -p "Ваш сервер находится в РФ и вам нужен Xray прокси (потребуется vless ссылка)? [y/N]: " NEED_XRAY
 
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     read -r -p "Введите вашу VLESS ссылку (vless://uuid@host:port?params...): " VLESS_LINK
@@ -317,6 +317,14 @@ sudo docker pull oci.element.io/element-admin:latest
 # Установка Ansible и подготовка репозитория
 sudo apt install software-properties-common
 sudo add-apt-repository --yes --update ppa:ansible/ansible
+
+# Официальный скрипт для установки just (если в стандартных репозиториях его нет)
+curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/local/bin
+#ИЛИ
+#echo "deb [signed-by=/usr/share/keyrings/azlux-archive-keyring.gpg] http://packages.azlux.fr/debian/ stable main" | sudo tee /etc/apt/sources.list.d/azlux.list
+#sudo wget -O /usr/share/keyrings/azlux-archive-keyring.gpg https://azlux.fr/repo.gpg
+#sudo apt update
+
 sudo apt install ansible just -y
 
 cd ~ || {
@@ -360,17 +368,29 @@ matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ с�
 # Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
 matrix_well_known_matrix_client_enabled: true
 # Для федерации
+matrix_federation_public_port: 443
 matrix_static_files_container_labels_base_domain_enabled: true
+devture_systemd_docker_base_ipv6_enabled: true
 
 # обратный прокси - traefik - дефолт для этого ansible playbook
 matrix_playbook_reverse_proxy_type: playbook-managed-traefik
 traefik_config_certificatesResolvers_acme_email: '$ADMIN_EMAIL'   # ВСТАВИТЬ EMAIL ДЛЯ ИНФОРМАЦИИ ОБ SSL СЕРТИФИКАТОВ ОТ  LET'S ENCRYPT
 
-devture_systemd_docker_base_ipv6_enabled: true
-devture_systemd_service_manager_up_verification_delay_seconds: 45
-
+# Настройки для Synapse
 matrix_homeserver_implementation: synapse
 matrix_homeserver_generic_secret_key: '$GENERIC_SECRET'           # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для матрикс-сервера)
+# Глобальный таймаут Ansible (время ожидания ответа от системы)
+# Время, которое дается systemd для перезапуска сервисов (секунды)
+devture_systemd_service_manager_up_verification_delay_seconds: 600
+# Увеличиваем таймаут запуска в самом systemd (в секундах)
+matrix_synapse_systemd_service_specific_options: |
+  TimeoutStartSec=600
+# Настройки для Element Admin (часто падает из-за ещё не работающих зависимостей)
+matrix_element_admin_systemd_service_specific_options: |
+  TimeoutStartSec=300
+  TimeoutStopSec=60
+  TimeoutStopSec=60
+
 postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
 
 # (Если у вас сервер - Synapse и не используется MAS, то настраиваем это на true)
@@ -381,8 +401,25 @@ matrix_synapse_enable_registration_captcha: false
 # Разрешает регистрационные токены Synapse (у MAS свои токены и настройка для них)
 matrix_synapse_registration_requires_token: false
 
-# Настройки прокси для synapse
+# ntfy для уведомлений
+ntfy_enabled: true
+# Для ntfy Настройки прокси и DNS
+ntfy_container_extra_arguments:
+  - "--env"
+  - "http_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  - "https_proxy={{ your_proxy_http_proxy }}"
+  - "--env"
+  - "no_proxy={{ your_proxy_no_proxy }}"
+  - "--dns"
+  - "127.0.0.11"
+
+# Явно говорим synapse где искать локальный ntfy
+matrix_synapse_container_extra_hosts:
+  - "{{ ntfy_hostname }}:host-gateway"
+# Для Synapse настройки прокси, DNS и уведомления
 matrix_synapse_container_extra_arguments:
+  - "--add-host={{ ntfy_hostname }}:host-gateway"
   - "--env"
   - "http_proxy={{ your_proxy_http_proxy }}"
   - "--env"
@@ -394,12 +431,17 @@ matrix_synapse_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
-
 # Дополнительные настройки Synapse
-#matrix_synapse_configuration_extension_yaml: |
-  # Список комнат, в которые пользователь попадет сразу после регистрации
+matrix_synapse_configuration_extension_yaml: |
+  #Список комнат, в которые пользователь попадет сразу после регистрации
   #auto_join_rooms:
   #  - "#your-room:your-server.com"
+  #белые списки Synapse чтобы он мог обращаться к другим сервисам по локальному ip (важно для работающих уведомлений)
+  ip_range_whitelist:
+    - "172.16.0.0/12"
+    - "10.0.0.0/8"
+    - "127.0.0.0/8"
+    - "192.168.0.0/16"
 
 # Настраиваем ограничения сервера synapse чтобы не нагружать процессор огромными matrix-комнатами
 matrix_synapse_limit_remote_rooms_enabled: true
@@ -431,13 +473,11 @@ livekit_server_configuration_extension_yaml: |
 livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
-# ntfy для уведомлений
-ntfy_enabled: true
-
 # Админка synapse (доступ: *ваш хост*/synapse-admin )
 matrix_synapse_admin_enabled: false
 # Если включен MAS, то лучше использовать element_admin, а не synapse_admin
 matrix_element_admin_enabled: true
+
 
 # Настройка Matrix Authentication Service (MAS)
 matrix_authentication_service_enabled: true
@@ -453,12 +493,12 @@ matrix_authentication_service_config_account_password_registration_enabled: true
 matrix_authentication_service_config_account_registration_token_required: true
 # Требовать email при регистрации
 matrix_authentication_service_config_account_password_registration_email_required: false
-
-# Позволяет пользователям самостоятельно Сбрасывать пароль по почте
+# Позволяет пользователям самостоятельно Сбрасывать пароль по почте (нужно настроить работу с почтой на вашем сервере)
 matrix_authentication_service_config_account_password_recovery_enabled: false
 # Позволяет пользователям самостоятельно Менять пароль в настройках
 matrix_authentication_service_config_account_password_change_allowed: true
 
+# Настройки прокси для MAS
 matrix_authentication_service_container_extra_arguments:
   - "--env"
   - "http_proxy={{ your_proxy_http_proxy }}"
@@ -471,6 +511,7 @@ matrix_authentication_service_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+
 
 # Web-client Element
 matrix_client_element_enabled: true
@@ -492,7 +533,7 @@ matrix_client_element_configuration_extension_json: |
 EOF
 
 # Запуск установки
-echo "Запускаем установку Matrix. Это займет 10-20 минут..."
+echo "Запускаем установку Matrix. Это займет ~30 минут..."
 ansible-playbook -i inventory/hosts setup.yml --tags=install-all,ensure-matrix-users-created,start
 
 # Регистрация администратора
@@ -510,8 +551,10 @@ sudo ufw allow 7880/tcp
 sudo ufw allow 7881/tcp
 sudo ufw allow 7882/udp
 sudo ufw allow 8448/tcp
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
 sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
+fi
 sudo ufw allow 49152:49652/udp
 sudo ufw enable
 
