@@ -555,7 +555,7 @@ sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
 sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
 fi
 sudo ufw allow 49152:49652/udp
-sudo ufw enable
+sudo ufw --force enable
 
 printf "\n\n\n%s\n\n" "Установка завершена!"
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
