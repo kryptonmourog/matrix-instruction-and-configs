@@ -367,10 +367,10 @@ matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ с�
 
 # Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
 matrix_well_known_matrix_client_enabled: true
+
 # Для федерации
 matrix_federation_public_port: 443
 matrix_static_files_container_labels_base_domain_enabled: true
-devture_systemd_docker_base_ipv6_enabled: true
 
 # обратный прокси - traefik - дефолт для этого ansible playbook
 matrix_playbook_reverse_proxy_type: playbook-managed-traefik
@@ -379,6 +379,7 @@ traefik_config_certificatesResolvers_acme_email: '$ADMIN_EMAIL'   # ВСТАВИ
 # Настройки для Synapse
 matrix_homeserver_implementation: synapse
 matrix_homeserver_generic_secret_key: '$GENERIC_SECRET'           # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для матрикс-сервера)
+
 # Глобальный таймаут Ansible (время ожидания ответа от системы)
 # Время, которое дается systemd для перезапуска сервисов (секунды)
 devture_systemd_service_manager_up_verification_delay_seconds: 600
@@ -417,6 +418,7 @@ ntfy_container_extra_arguments:
 # Явно говорим synapse где искать локальный ntfy
 matrix_synapse_container_extra_hosts:
   - "{{ ntfy_hostname }}:host-gateway"
+
 # Для Synapse настройки прокси, DNS и уведомления
 matrix_synapse_container_extra_arguments:
   - "--add-host={{ ntfy_hostname }}:host-gateway"
@@ -431,6 +433,7 @@ matrix_synapse_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+
 # Дополнительные настройки Synapse
 matrix_synapse_configuration_extension_yaml: |
   #Список комнат, в которые пользователь попадет сразу после регистрации
@@ -550,6 +553,7 @@ sudo ufw allow 7880/tcp
 sudo ufw allow 7881/tcp
 sudo ufw allow 7882/udp
 sudo ufw allow 8448/tcp
+
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
 sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
