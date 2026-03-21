@@ -1,4 +1,6 @@
 # Матрикс. Инструкции и конфиги
+[English ReadMe](https://github.com/kryptonmourog/matrix-instruction-and-configs/blob/master/README_EN.MD)
+
 Репозиторий на базе которого всё делаем:
 https://github.com/spantaleev/matrix-docker-ansible-deploy
 
