@@ -9,10 +9,8 @@ https://github.com/spantaleev/matrix-docker-ansible-deploy
 curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
 
-Моя инструкция:
-
-
 Видео-инструкция:
+https://www.youtube.com/watch?v=GGaM5asQGxE
 
 
 ## Полный гайд
