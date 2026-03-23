@@ -372,7 +372,6 @@ matrix_playbook_migration_validated_version: v2026.03.23.0
 matrix_well_known_matrix_client_enabled: true
 
 # Для федерации
-matrix_federation_public_port: 443
 matrix_static_files_container_labels_base_domain_enabled: true
 
 # обратный прокси - traefik - дефолт для этого ansible playbook
