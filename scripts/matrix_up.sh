@@ -366,7 +366,7 @@ matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ с�
 
 
 # Проверка версии плейбука
-matrix_playbook_migration_validated_version: v2026.03.23.0
+matrix_playbook_migration_validated_version: v2026.04.03.0
 
 # Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
 matrix_well_known_matrix_client_enabled: true
