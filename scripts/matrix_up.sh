@@ -508,8 +508,6 @@ livekit_server_configuration_extension_yaml: |
 livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
-# Админка synapse (доступ: *ваш хост*/synapse-admin )
-matrix_synapse_admin_enabled: false
 # Если включен MAS, то лучше использовать element_admin, а не synapse_admin
 matrix_element_admin_enabled: true
 
