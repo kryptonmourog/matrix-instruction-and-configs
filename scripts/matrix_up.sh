@@ -565,13 +565,6 @@ matrix_client_element_configuration_extension_json: |
   }
 EOF
 
-# Запуск установки
-echo "Запускаем установку Matrix. Это займет ~30 минут..."
-ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
-
-# Регистрация администратора
-ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
-
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
@@ -583,6 +576,13 @@ sudo ufw allow 7880/tcp
 sudo ufw allow 7881/tcp
 sudo ufw allow 7882/udp
 sudo ufw allow 8448/tcp
+
+# Запуск установки
+echo "Запускаем установку Matrix. Это займет ~30 минут..."
+ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
+
+# Регистрация администратора
+ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
 
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
