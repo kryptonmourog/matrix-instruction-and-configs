@@ -1,5 +1,5 @@
 const fs = require('fs');
-const Outbound = require('./vless_outbound_parsing.js');
+const Outbound = require('./xray_outbound_parsing.js');
 
 // Получаем ссылку из аргументов командной строки
 const link = process.argv[2];
