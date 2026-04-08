@@ -118,8 +118,7 @@ else
 fi
 
 # Установка докера через официальный скрипт
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
+bash <(curl -sSL https://get.docker.com)
 
 # Запуск и включение в автозагрузку
 sudo systemctl enable --now docker
