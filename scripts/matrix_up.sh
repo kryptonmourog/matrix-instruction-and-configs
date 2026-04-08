@@ -21,6 +21,27 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     read -r -p "Введите вашу VLESS ссылку (vless://uuid@host:port?params...): " VLESS_LINK
 fi
 
+# Функция для запуска тяжелых команд с несколькими попытками
+run_with_retry() {
+    max_attempts=15 # количество попыток
+    iterator=1
+    local cmd="$1"
+
+    while [ $iterator -le $max_attempts ]; do
+        echo "Запуск: $cmd (Попытка $iterator)"
+        if eval "$cmd"; then
+            echo "Команда '$cmd' выполнена успешно!"
+            return 0
+        fi
+        echo "Ошибка при выполнении. Повтор через 5 секунд..."
+        sleep 5
+        ((iterator++))
+    done
+
+    echo "Ошибка: Команда '$cmd' не удалась после $max_attempts попыток."
+    return 1
+}
+
 
 # Генерация случайных паролей
 GENERIC_SECRET=$(openssl rand -hex 32)
@@ -118,7 +139,7 @@ else
 fi
 
 # Установка докера через официальный скрипт
-bash <(curl -sSL https://get.docker.com)
+run_with_retry "bash <(curl -sSL https://get.docker.com)"
 
 # Запуск и включение в автозагрузку
 sudo systemctl enable --now docker
@@ -127,7 +148,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart docker
 # ЕСЛИ ставим Element Admin, то:
 echo "Подготовка образа Element Admin..."
-sudo docker pull oci.element.io/element-admin:latest
+run_with_retry "sudo docker pull oci.element.io/element-admin:latest"
 
 # Установка Ansible и подготовка репозитория
 sudo apt install software-properties-common
@@ -153,7 +174,8 @@ cd matrix-docker-ansible-deploy || {
     printf "\e[31mОшибка: Директория matrix-docker-ansible-deploy не найдена. Проверьте, прошел ли git clone.\e[0m\n"
     exit 1
 }
-sudo just update
+
+run_with_retry "just update"
 
 # Создаем каталог для хранения вашей конфигурации
 mkdir -p "inventory/host_vars/$DOMAIN_MATRIX"
@@ -426,8 +448,7 @@ sudo ufw --force enable
 
 # Запуск установки
 echo "Запускаем установку Matrix. Это займет ~30 минут..."
-sudo just update
-ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
+run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
 
 # Регистрация администратора
 ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
