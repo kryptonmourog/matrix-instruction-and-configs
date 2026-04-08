@@ -38,6 +38,7 @@
       "protocol": "vless",
       "settings": {
         "vnext": [
+          {
 // IP АДРЕС ВАШЕГО XRAY ПРОКСИ-СЕРВЕРА
             "address": "",
             "port": 443,
