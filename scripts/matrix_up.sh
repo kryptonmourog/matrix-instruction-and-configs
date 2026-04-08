@@ -164,13 +164,20 @@ echo "$DOMAIN_MATRIX ansible_host=127.0.0.1 ansible_connection=local" >> invento
 
 
 # Создание vars.yml с подставленными значениями
-sudo tee "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF
+sudo tee "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 ---
 
 your_ip: "$YOUR_IP"
+EOF
+
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
+    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 your_proxy_http_proxy: "$PROXY_URL"
 your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-authentication-service,matrix-postgres,matrix-exim-relay,172.16.0.0/12"
+EOF
+fi
 
+sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 matrix_domain: "$DOMAIN"                                  # ВСТАВИТЬ свой ОСНОВНОЙ ДОМЕН
 matrix_server_fqn_matrix: "$DOMAIN_MATRIX"                # ВСТАВИТЬ свой домен для MATRIX
 coturn_hostname: "$DOMAIN_COTURN"                         # ВСТАВИТЬ свой домен для COTURN (старые звонки 1-на-1)
@@ -250,6 +257,10 @@ matrix_synapse_media_retention_remote_media_lifetime: 2w
 
 # ntfy для уведомлений
 ntfy_enabled: true
+EOF
+
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
+    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 # Для ntfy Настройки прокси и DNS
 ntfy_container_extra_arguments:
   - "--env"
@@ -260,7 +271,11 @@ ntfy_container_extra_arguments:
   - "no_proxy={{ your_proxy_no_proxy }}"
   - "--dns"
   - "127.0.0.11"
+EOF
+fi
 
+
+sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 # Явно говорим synapse где искать локальный ntfy
 matrix_synapse_container_extra_hosts:
   - "{{ ntfy_hostname }}:host-gateway"
@@ -268,6 +283,10 @@ matrix_synapse_container_extra_hosts:
 # Для Synapse настройки прокси, DNS и уведомления
 matrix_synapse_container_extra_arguments:
   - "--add-host={{ ntfy_hostname }}:host-gateway"
+EOF
+
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
+    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
   - "--env"
   - "http_proxy={{ your_proxy_http_proxy }}"
   - "--env"
@@ -279,7 +298,10 @@ matrix_synapse_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+EOF
+fi
 
+sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 # Дополнительные настройки Synapse
 matrix_synapse_configuration_extension_yaml: |
   #Список комнат, в которые пользователь попадет сразу после регистрации
@@ -344,7 +366,10 @@ matrix_authentication_service_config_account_password_registration_email_require
 matrix_authentication_service_config_account_password_recovery_enabled: false
 # Позволяет пользователям самостоятельно Менять пароль в настройках
 matrix_authentication_service_config_account_password_change_allowed: true
+EOF
 
+if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
+    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 # Настройки прокси для MAS
 matrix_authentication_service_container_extra_arguments:
   - "--env"
@@ -358,8 +383,10 @@ matrix_authentication_service_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+EOF
+fi
 
-
+sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 # Web-client Element
 matrix_client_element_enabled: true
 # Стандартный телефонный код (+7)
