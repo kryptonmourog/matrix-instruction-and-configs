@@ -51,7 +51,7 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/configs/xray.json
 
     # Установка Node.js для исполнения js-кода на сервере
-    sudo apt install nodejs npm
+    sudo apt install nodejs npm -y
     # Универсальный парсинг VLESS ссылки
     node xray_configurator.js "$VLESS_LINK"
     # Проверяем, что файл конфигурации создался и он не пустой
@@ -102,7 +102,7 @@ Environment="HTTP_PROXY=http://172.17.0.1:10809"
 Environment="HTTPS_PROXY=http://172.17.0.1:10809"
 Environment="NO_PROXY=localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
 EOF
-ls
+
     # Если Есть прокси, то прописываем его для synapse (PROXY_URL будет использоваться в конфиге vars,yml)
     PROXY_URL="http://172.17.0.1:10809"
 else
@@ -207,7 +207,6 @@ matrix_synapse_systemd_service_specific_options: |
 # Настройки для Element Admin (часто падает из-за ещё не работающих зависимостей)
 matrix_element_admin_systemd_service_specific_options: |
   TimeoutStartSec=300
-  TimeoutStopSec=60
   TimeoutStopSec=60
 
 postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
@@ -392,20 +391,20 @@ sudo ufw allow 7880/tcp
 sudo ufw allow 7881/tcp
 sudo ufw allow 7882/udp
 sudo ufw allow 8448/tcp
-
-# Запуск установки
-echo "Запускаем установку Matrix. Это займет ~30 минут..."
-ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
-
-# Регистрация администратора
-ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
-
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
 sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
 fi
 sudo ufw allow 49152:49652/udp
 sudo ufw --force enable
+
+# Запуск установки
+echo "Запускаем установку Matrix. Это займет ~30 минут..."
+sudo just update
+ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
+
+# Регистрация администратора
+ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
 
 printf "\n\n\n%s\n\n" "Установка завершена!"
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
