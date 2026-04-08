@@ -1,4 +1,4 @@
-const { ObjectUtil } = require('./vless_util.js');
+const { ObjectUtil } = require('./xray_util.js');
 const { URL, URLSearchParams } = require('url');
 
 const Protocols = {
