@@ -39,7 +39,6 @@ matrix_synapse_systemd_service_specific_options: |
 matrix_element_admin_systemd_service_specific_options: |
   TimeoutStartSec=300
   TimeoutStopSec=60
-  TimeoutStopSec=60
 
 postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
 
