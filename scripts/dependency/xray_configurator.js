@@ -3,7 +3,7 @@ const Outbound = require('./xray_outbound_parsing.js');
 
 // Получаем ссылку из аргументов командной строки
 const link = process.argv[2];
-const samplePath = './xray_sample.json';
+const samplePath = './xray.json';
 const outputPath = './config.json';
 const oldOutboundTag = "matrix_xray";
 
