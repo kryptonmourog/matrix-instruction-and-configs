@@ -1,3 +1,6 @@
+const { ObjectUtil } = require('./vless_util.js');
+const { URL, URLSearchParams } = require('url');
+
 const Protocols = {
     Freedom: "freedom",
     Blackhole: "blackhole",
@@ -888,11 +891,11 @@ class Outbound extends CommonClass {
     }
 
     static fromLink(link) {
-        data = link.split('://');
+        const data = link.split('://');
         if (data.length != 2) return null;
         switch (data[0].toLowerCase()) {
             case Protocols.VMess:
-                return this.fromVmessLink(JSON.parse(Base64.decode(data[1])));
+                return this.fromVmessLink(JSON.parse(Buffer.from(data[1], 'base64').toString('utf8')));
             case Protocols.VLESS:
             case Protocols.Trojan:
             case 'ss':
@@ -996,7 +999,7 @@ class Outbound extends CommonClass {
         port *= 1;
         if (protocol == 'ss') {
             protocol = 'shadowsocks';
-            userData = atob(userData).split(':');
+            userData = Buffer.from(userData, 'base64').toString('binary').split(':');
         }
         var settings;
         switch (protocol) {
@@ -1596,3 +1599,5 @@ Outbound.HysteriaSettings = class extends CommonClass {
         };
     }
 };
+
+module.exports = Outbound;
