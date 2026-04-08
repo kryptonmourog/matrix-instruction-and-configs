@@ -466,8 +466,8 @@ class Wireguard {
     }
 
     static generatePresharedKey() {
-        var privateKey = new Uint8Array(32);
-        window.crypto.getRandomValues(privateKey);
+        const crypto = require('crypto');
+        const privateKey = crypto.randomBytes(32);
         return privateKey;
     }
 
@@ -497,12 +497,7 @@ class Wireguard {
     }
 
     static keyFromBase64(encoded) {
-        const binaryStr = atob(encoded);
-        const bytes = new Uint8Array(binaryStr.length);
-        for (let i = 0; i < binaryStr.length; i++) {
-            bytes[i] = binaryStr.charCodeAt(i);
-        }
-        return bytes;
+        return new Uint8Array(Buffer.from(encoded, 'base64'));
     }
 
     static generateKeypair(secretKey = '') {
@@ -549,29 +544,23 @@ class ClipboardManager {
 
 class Base64 {
     static encode(content = "", safe = false) {
+        let res = Buffer.from(content, 'utf8').toString('base64');
+
         if (safe) {
-            return Base64.encode(content)
+            return res
                 .replace(/\+/g, '-')
                 .replace(/=/g, '')
                 .replace(/\//g, '_')
         }
-
-        return window.btoa(
-            String.fromCharCode(...new TextEncoder().encode(content))
-        )
+        return res;
     }
 
     static alternativeEncode(content) {
-        return window.btoa(
-            content
-        )
+        return Buffer.from(content, 'binary').toString('base64');
     }
 
     static decode(content = "") {
-        return new TextDecoder()
-            .decode(
-                Uint8Array.from(window.atob(content), c => c.charCodeAt(0))
-            )
+        return Buffer.from(content, 'base64').toString('utf8');
     }
 }
 
@@ -916,4 +905,8 @@ class IntlUtil {
 
         return formatter.format(diff, 'day');
     }
+}
+
+if (typeof module !== 'undefined') {
+    module.exports = { ObjectUtil };
 }
