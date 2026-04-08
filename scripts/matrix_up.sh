@@ -182,7 +182,7 @@ matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ с�
 
 
 # Проверка версии плейбука
-matrix_playbook_migration_validated_version: v2026.03.23.0
+matrix_playbook_migration_validated_version: v2026.04.03.0
 
 # Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
 matrix_well_known_matrix_client_enabled: true
@@ -324,8 +324,6 @@ livekit_server_configuration_extension_yaml: |
 livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
-# Админка synapse (доступ: *ваш хост*/synapse-admin )
-matrix_synapse_admin_enabled: false
 # Если включен MAS, то лучше использовать element_admin, а не synapse_admin
 matrix_element_admin_enabled: true
 
@@ -383,13 +381,6 @@ matrix_client_element_configuration_extension_json: |
   }
 EOF
 
-# Запуск установки
-echo "Запускаем установку Matrix. Это займет ~30 минут..."
-ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
-
-# Регистрация администратора
-ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
-
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
@@ -401,6 +392,13 @@ sudo ufw allow 7880/tcp
 sudo ufw allow 7881/tcp
 sudo ufw allow 7882/udp
 sudo ufw allow 8448/tcp
+
+# Запуск установки
+echo "Запускаем установку Matrix. Это займет ~30 минут..."
+ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
+
+# Регистрация администратора
+ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
 
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
 sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
