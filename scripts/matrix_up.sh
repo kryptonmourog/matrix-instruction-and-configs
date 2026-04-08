@@ -43,36 +43,23 @@ echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 
 # Настройка XRAY
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    # Парсинг VLESS ссылки
-    # Убираем протокол
-    VLESS_STR=${VLESS_LINK#vless://}
-    # Извлекаем UUID (всё до @)
-    V_UUID=$(echo "$VLESS_STR" | cut -d'@' -f1)
-    # Извлекаем остальное
-    V_REMAIN=$(echo "$VLESS_STR" | cut -d'@' -f2)
-    # Извлекаем адрес и порт
-    V_ADDR_PORT=$(echo "$V_REMAIN" | cut -d'?' -f1)
-    V_ADDR=$(echo "$V_ADDR_PORT" | cut -d':' -f1)
-    V_PORT=$(echo "$V_ADDR_PORT" | cut -d':' -f2)
+    # Скачивание JS-скриптов для парсинга VLESS-ссылки (скрипты на базе 3X-UI с адаптацией под серверное выполнение)
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_outbound_parsing.js
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_util.js
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_configurator.js
+    # Скачивание шаблона для xray-конфигурации
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/configs/xray.json
 
-    # Извлекаем параметры (всё после ?)
-    V_PARAMS=$(echo "$V_REMAIN" | cut -d'?' -f2 | cut -d'#' -f1)
-
-    # Функция для извлечения конкретных параметров из строки
-    get_vless_param() {
-        echo "$V_PARAMS" | grep -oP "$1=\K[^&]+" | sed 's/%2F/\//g'
-    }
-
-    V_PBK=$(get_vless_param "pbk")
-    V_SNI=$(get_vless_param "sni")
-    V_SID=$(get_vless_param "sid")
-    V_FP=$(get_vless_param "fp")
-    V_TYPE=$(get_vless_param "type")
-    V_SECURITY=$(get_vless_param "security")
-    V_FLOW=$(get_vless_param "flow")
-    V_SPX=$(get_vless_param "spx")
-
-
+    # Установка Node.js для исполнения js-кода на сервере
+    sudo apt install nodejs npm
+    # Универсальный парсинг VLESS ссылки
+    node xray_configurator.js "$VLESS_LINK"
+    # Проверяем, что файл конфигурации создался и он не пустой
+    if [ -s "./config.json" ]; then
+        sudo cp ./config.json /usr/local/etc/xray/config.json
+    else
+        echo "Ошибка: Файл xray-конфига не был создан"
+    fi
 
     # Установка и настройка Xray
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
@@ -80,180 +67,9 @@ if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     sudo wget https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat -O /usr/local/share/xray/geosite.dat
     sudo wget https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat -O /usr/local/share/xray/geoip.dat
     # Запись конфига с подставленными значениями
-    sudo tee /usr/local/etc/xray/config.json <<EOF
-{
-  "log": { "loglevel": "info" },
-  "inbounds": [
-    {
-      "tag": "socks-in",
-      "port": 10808,
-      "listen": "0.0.0.0",
-      "protocol": "socks",
-      "settings": { "auth": "noauth", "udp": true }
-    },
-    {
-      "tag": "http-in",
-      "port": 10809,
-      "listen": "0.0.0.0",
-      "protocol": "http",
-      "settings": { "enabled": true, "allowTransparent": false }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "Personality-matrix_xray",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-// IP АДРЕС ВАШЕГО XRAY ПРОКСИ-СЕРВЕРА
-            "address": "$V_ADDR",
-            "port": $V_PORT,
-            "users": [
-              {
-// ВАШ USER ID (то что стоит после "vless://" и до "@ip.вашего.сервера")
-                "id": "$V_UUID",
-                // encryption
-                "encryption": "none",
-                // flow
-                "flow": "$V_FLOW"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        // type
-        "network": "${V_TYPE:-tcp}",
-        // security
-        "security": "$V_SECURITY",
-        "realitySettings": {
-          // pbk
-          "publicKey": "$V_PBK",
-          // fp
-          "fingerprint": "$V_FP",
-          // sni
-          "serverName": "$V_SNI",
-          // sid
-          "shortId": "$V_SID",
-          // spx
-          "spiderX": "${V_SPX:-/}"
-        },
-        "xhttpSettings": {
-          // path
-          "path": "/",
-          "mode": "auto",
-          "extra": {
-            "noGRPCHeader": false
-          }
-        }
-      }
-    },
-    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
-    { "tag": "block", "protocol": "blackhole", "settings": {} }
-  ],
-  "dns": {
-    "servers": [
-      // Приоритетный DNS для СНГ доменов (быстрый, без прокси)
-      {
-        "address": "77.88.8.8",     // DNS Яндекса
-        "port": 53,
-        "expectIPs": ["geoip:ru"],
-        "domains": [
-          "geosite:ru-available-only-inside",
-          "regexp:^.*\\\\.ru$",
-          "regexp:\\\\.su$",
-          "regexp:\\\\.kz$",
-          "regexp:\\\\.by$",
-          "regexp:\\\\.xn--p1acf$",    // .рус
-          "regexp:\\\\.xn--80adxhks$", // .москва
-          "regexp:\\\\.xn--p1ai$",     // .рф
-          "regexp:\\\\.xn--90ais$"     // .бел
-        ]
-      },
-      // Глобальные DNS для всего остального
-      {
-        "address": "1.1.1.1",       // DNS Cloudflare
-        "port": 53,
-        "domains": [] // "все остальные"
-      },
-      {
-        "address": "8.8.8.8",       // DNS Google
-        "port": 53,
-        "domains": [] // "все остальные"
-      }
-    ],
-    "queryStrategy": "UseIPv4"
-  },
-  "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      // Локальный трафик - напрямую
-      {
-        "type": "field",
-        "ip": [
-          "geoip:private",
-          "172.16.0.0/12",
-          "10.0.0.0/8",
-          "127.0.0.0/8",
-          "fd42:f167:100f::/48"
-        ],
-        "outboundTag": "direct"
-      },
-      // Крупные зарубежные matrix-сервера - в прокси-сервер
-      {
-        "type": "field",
-        "domain": [
-          "matrix.org",          // Самый крупный узел
-          "element.io",          // Разработчики и их инфраструктура
-          "gitter.im",           // Мост с Gitter
-          "mozilla.org",         // Сообщество Mozilla
-          "kde.org",             // Сообщество KDE
-          "gnome.org",           // Сообщество GNOME
-          "t2l.io",              // Популярный хостинг ботов или мостов
-          "grin.hu",             // Популярный хостинг ботов или мостов
-          "fedora.im",           // Сообщество Fedora
-          "matrix.v.systems",    // Популярный азиатский узел
-          "modular.im"           // Хостинг для платных серверов
-        ],
-        "outboundTag": "Personality-matrix_xray"
-      },
-      // Российские IP - напрямую
-      {
-        "type": "field",
-        "ip": ["geoip:ru"],
-        "outboundTag": "direct"
-      },
-      // СНГ Домены - напрямую
-      {
-        "type": "field",
-        "domain": [
-          "geosite:ru-available-only-inside",
-          "regexp:^.*\\\\.ru$",
-          "regexp:\\\\.su$",
-          "regexp:\\\\.kz$",
-          "regexp:\\\\.by$",
-          "regexp:\\\\.xn--p1acf$",    // .рус
-          "regexp:\\\\.xn--80adxhks$", // .москва
-          "regexp:\\\\.xn--p1ai$",     // .рф
-          "regexp:\\\\.xn--90ais$"     // .бел
-        ],
-        "outboundTag": "direct"
-      },
-      // Всё остальное - в прокси-сервер
-      {
-        "type": "field",
-        "network": "tcp,udp",
-        "outboundTag": "Personality-matrix_xray"
-      }
-    ]
-  }
-}
-EOF
-
+    sudo mv ./config.json /usr/local/etc/xray/config.json
     sudo systemctl restart xray
-    echo "Ожидание перезапуска Xray..."
-    sleep 15
+    echo "Конфиг обновлен и Xray перезапущен"
 
     # Экспортируем переменные для прокси в ТЕКУЩУЮ сессию скрипта
     export http_proxy="http://127.0.0.1:10809"
@@ -286,7 +102,7 @@ Environment="HTTP_PROXY=http://172.17.0.1:10809"
 Environment="HTTPS_PROXY=http://172.17.0.1:10809"
 Environment="NO_PROXY=localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
 EOF
-
+ls
     # Если Есть прокси, то прописываем его для synapse (PROXY_URL будет использоваться в конфиге vars,yml)
     PROXY_URL="http://172.17.0.1:10809"
 else
