@@ -9,7 +9,7 @@ const oldOutboundTag = "matrix_xray";
 
 try {
     if (!link) {
-        throw new Error("Ссылка не передана. Использование: node app.js '<link>'");
+        throw new Error("Ссылка не передана. Использование: node xray_configurator.js '<link>'");
     }
     // Читаем и парсим существующий конфиг
     let rawData = fs.readFileSync(samplePath, 'utf8');
@@ -28,9 +28,42 @@ try {
     const newTag = outboundInstance.tag;
     newOutbound.tag = newTag;
 
+    // Сохраняем временные данные из "плоского" объекта 3x-ui
+    const rawSettings = newOutbound.settings;
+
+    // Формируем стандартную структуру Xray-core
+    const correctOutbound = {
+        tag: newTag,
+        protocol: "vless",
+        settings: {
+            vnext: [
+                {
+                    address: rawSettings.address,
+                    port: parseInt(rawSettings.port),
+                    users: [
+                        {
+                            id: rawSettings.id,
+                            encryption: rawSettings.encryption || "none",
+                            flow: rawSettings.flow || ""
+                        }
+                    ]
+                }
+            ]
+        },
+        streamSettings: newOutbound.streamSettings
+    };
+
+    // Очистка RealitySettings от мусорных полей для универсальности
+    if (correctOutbound.streamSettings && correctOutbound.streamSettings.realitySettings) {
+        const rs = correctOutbound.streamSettings.realitySettings;
+        delete rs.show;          // Удаляем специфичное для 3x-ui поле
+        delete rs.mldsa65Verify; // Удаляем экспериментальное поле
+        delete rs.testseed;      // Удаляем мусорное поле
+    }
+
     // Заменяем старый outbound на новый
     xrayConfig.outbounds = xrayConfig.outbounds.map(out =>
-        out.tag === oldOutboundTag ? newOutbound : out
+        out.tag === oldOutboundTag ? correctOutbound : out
     );
 
     // Массовая замена outboundTag в правилах маршрутизации
