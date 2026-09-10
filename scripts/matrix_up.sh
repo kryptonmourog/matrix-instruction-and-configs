@@ -366,8 +366,6 @@ livekit_server_configuration_extension_yaml: |
 livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
-# Админка Ketesa (бывший synapse-admin от etke.cc ( доступ: *ваш хост*/ketesa )
-matrix_ketesa_enabled: true
 # Админка Element Admin
 matrix_element_admin_enabled: true
 
