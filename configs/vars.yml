@@ -171,7 +171,7 @@ matrix_authentication_service_config_account_login_with_email_allowed: false
 # Включаем возможность регистрации по паролю, а не только через сторонних auth-поставщиков
 matrix_authentication_service_config_account_password_registration_enabled: true
 # Требовать токен для регистрации
-matrix_authentication_service_config_account_registration_token_required: true
+matrix_authentication_service_config_account_password_registration_token_required: true
 # Требовать email при регистрации
 matrix_authentication_service_config_account_password_registration_email_required: false
 # Позволяет пользователям самостоятельно Сбрасывать пароль по почте (нужно настроить работу с почтой на вашем сервере)
