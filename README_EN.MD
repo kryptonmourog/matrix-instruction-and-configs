@@ -22,7 +22,6 @@ Video instruction:
 ## Where to find everything
 Configs:
 - In this repository, in the `configs` folder
-- On [Google Drive](https://drive.google.com/drive/folders/19sAK_zFnkTSvaXpGAVQMVVvMndwjVYdQ?usp=drive_link)
 
 Scripts:
 - In this repository, in the `scripts` folder
