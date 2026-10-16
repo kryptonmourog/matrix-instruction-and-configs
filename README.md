@@ -25,7 +25,6 @@ https://www.youtube.com/watch?v=l7BLIRAxqzs
 ## Где что искать
 Конфиги:
 - В этом репозитории, в папке `configs`
-- На [Google Drive](https://drive.google.com/drive/folders/19sAK_zFnkTSvaXpGAVQMVVvMndwjVYdQ?usp=drive_link)
 
 Скрипты:
 - В этом репозитории, в папке `scripts`
