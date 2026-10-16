@@ -195,7 +195,7 @@ EOF
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
 your_proxy_http_proxy: "$PROXY_URL"
-your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-authentication-service,matrix-postgres,matrix-exim-relay,172.16.0.0/12"
+your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-authentication-service,matrix-postgres,172.16.0.0/12"
 EOF
 fi
 
@@ -229,13 +229,10 @@ matrix_homeserver_generic_secret_key: '$GENERIC_SECRET'           # ВСТАВИ
 # Глобальный таймаут Ansible (время ожидания ответа от системы)
 # Время, которое дается systemd для перезапуска сервисов (секунды)
 devture_systemd_service_manager_up_verification_delay_seconds: 600
-# Увеличиваем таймаут запуска в самом systemd (в секундах)
-matrix_synapse_systemd_service_specific_options: |
-  TimeoutStartSec=600
-# Настройки для Element Admin (часто падает из-за ещё не работающих зависимостей)
-matrix_element_admin_systemd_service_specific_options: |
-  TimeoutStartSec=300
-  TimeoutStopSec=60
+# Количество попыток повторить запуск сервисов
+devture_systemd_service_manager_all_at_once_retries: 5
+# Количество секунд между попытками перезапустить сервисы
+devture_systemd_service_manager_all_at_once_retry_delay_seconds: 30
 
 postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
 
@@ -361,6 +358,16 @@ livekit_server_config_turn_external_tls: true
 livekit_server_configuration_extension_yaml: |
   rtc:
     force_tcp: true
+  # Сообщаем lk-jwt-service о выходе участников, иначе он бесконечно продлевает
+  # отложенное событие выхода (MSC4140) и сессия в звонке "зависает".
+  webhook:
+    api_key: "{{ matrix_livekit_jwt_service_environment_variable_livekit_key }}"
+    urls:
+      - "http://matrix-livekit-jwt-service:8080/sfu_webhook"
+
+# Запасной механизм: периодически проверять, что участник ещё есть на SFU.
+matrix_livekit_jwt_service_environment_variables_extension: |
+  LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS=60
 
 # Если сервер не знает своего внешнего IP, пакеты застревают
 livekit_rtc_use_external_ip: true
