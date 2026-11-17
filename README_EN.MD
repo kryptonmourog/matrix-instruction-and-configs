@@ -25,3 +25,6 @@ Configs:
 
 Scripts:
 - In this repository, in the `scripts` folder
+
+## License
+GNU GPL v3.0, see [LICENSE](LICENSE). Part of the Xray JS scripts is adapted from [3X-UI](https://github.com/MHSanaei/3x-ui) (GPL-3.0).

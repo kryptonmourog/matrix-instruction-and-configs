@@ -28,3 +28,6 @@ https://www.youtube.com/watch?v=l7BLIRAxqzs
 
 Скрипты:
 - В этом репозитории, в папке `scripts`
+
+## Лицензия
+GNU GPL v3.0, см. [LICENSE](LICENSE). Часть JS-скриптов для Xray адаптирована из [3X-UI](https://github.com/MHSanaei/3x-ui) (GPL-3.0).
