@@ -65,11 +65,11 @@ echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 # Настройка XRAY
 if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
     # Скачивание JS-скриптов для парсинга VLESS-ссылки (скрипты на базе 3X-UI с адаптацией под серверное выполнение)
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_outbound_parsing.js
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_util.js
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/dependency/xray_configurator.js
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_outbound_parsing.js
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_util.js
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_configurator.js
     # Скачивание шаблона для xray-конфигурации
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/configs/xray.json
+    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/configs/xray.json
 
     # Установка Node.js для исполнения js-кода на сервере
     sudo apt install nodejs npm -y

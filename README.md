@@ -8,7 +8,7 @@ https://github.com/spantaleev/matrix-docker-ansible-deploy
 
 **Команда для запуска скрипта установки (скопировать и запустить НА СЕРВЕРЕ):**
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
 
 Видео-инструкция:

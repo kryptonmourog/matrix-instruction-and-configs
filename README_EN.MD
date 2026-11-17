@@ -5,7 +5,7 @@ The repository this is based on:
 ## Short Guide
 **Command to run the installation script (copy and run ON THE SERVER):**
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/heads/master/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
 
 Video instruction:
