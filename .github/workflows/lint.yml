@@ -1,0 +1,28 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (install script)
+        run: shellcheck -x scripts/matrix_up.sh
+
+      - name: bash syntax
+        run: bash -n scripts/matrix_up.sh
+
+      - name: node syntax (xray scripts)
+        run: |
+          for f in scripts/dependency/*.js; do
+            node --check "$f"
+          done
+
+      - name: vars.yml template parses as YAML
+        run: |
+          sudo apt-get install -y -qq python3-yaml
+          python3 -c "import yaml; yaml.safe_load(open('configs/vars.yml', encoding='utf-8')); print('ok')"

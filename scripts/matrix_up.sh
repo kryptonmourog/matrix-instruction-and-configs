@@ -1,33 +1,54 @@
 #!/bin/bash
+# Установка Matrix (matrix-docker-ansible-deploy) и, по желанию, Xray-прокси.
+#
+# Значения берутся из файла .env рядом со скриптом. Недостающие значения спрашиваются
+# и сохраняются в .env. Секреты генерируются один раз и тоже сохраняются, поэтому
+# повторный запуск не меняет пароль БД и ключи уже установленного сервера.
+# Шаблон конфига ansible (configs/vars.yml) скачивается из репозитория и заполняется из .env.
+#
+# Запуск: sudo ./matrix_up.sh
 
-read -r -p "Введите IP (v4) сервера: " YOUR_IP
-read -r -p "Введите ваш основной домен (например, example.com): " DOMAIN
-# ОПРЕДЕЛЕНИЕ ТЕХНИЧЕСКИХ ДОМЕНОВ (Важно для путей!)
-read -r -p "Поддомен для Matrix (например, mat.example.com): " DOMAIN_MATRIX
-read -r -p "Поддомен для Element Web (например, elem.example.com): " DOMAIN_WEB_CLIENT
-read -r -p "Поддомен для Element Admin (например, admin.example.com): " DOMAIN_ADMIN_PANEL
-read -r -p "Поддомен для Coturn (например, turn.example.com): " DOMAIN_COTURN
-read -r -p "Поддомен для Element Call (например, call.example.com): " DOMAIN_CALL
-read -r -p "Поддомен для ntfy (сервис уведомлений) (например, ntfy.example.com): " DOMAIN_NTFY
+set -euo pipefail
 
-read -r -p "Введите желаемый логин для Админа Matrix (в нижнем_регистре): " ADMIN_NICK
-read -r -p "Введите желаемый пароль для Админа Matrix (без восклицательных знаков): " ADMIN_PASS
-# Запрос email для SSL (Let's Encrypt)
-read -r -p "Введите ваш Email для SSL-уведомлений (от Let's Encrypt): " ADMIN_EMAIL
-# Опрос пользователя касаемо XRAY vless/reality
-read -r -p "Ваш сервер находится в РФ и вам нужен Xray прокси (потребуется vless ссылка)? [y/N]: " NEED_XRAY
+RAW_BASE="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.1.0"
+PLAYBOOK_REPO="https://github.com/spantaleev/matrix-docker-ansible-deploy.git"
+PROXY_PORT=10809
+DOCKER_BRIDGE_IP="172.17.0.1"
 
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    read -r -p "Введите вашу VLESS ссылку (vless://uuid@host:port?params...): " VLESS_LINK
+RED='\e[31m'
+NC='\e[0m'
+die() {
+    printf "${RED}Ошибка: %s${NC}\n" "$*" >&2
+    exit 1
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    die "запустите скрипт через sudo: sudo ./matrix_up.sh"
 fi
+
+# Домашний каталог того, кто запустил sudo (а не /root)
+TARGET_USER="${SUDO_USER:-root}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[ -n "$TARGET_HOME" ] || die "не удалось определить домашний каталог пользователя $TARGET_USER"
+REPO_DIR="$TARGET_HOME/matrix-docker-ansible-deploy"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# Рабочая папка для скачанных файлов. Удаляется при любом выходе.
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+touch "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 
 # Функция для запуска тяжелых команд с несколькими попытками
 run_with_retry() {
-    max_attempts=15 # количество попыток
-    iterator=1
+    local max_attempts=15
+    local iterator=1
     local cmd="$1"
 
-    while [ $iterator -le $max_attempts ]; do
+    while [ "$iterator" -le "$max_attempts" ]; do
         echo "Запуск: $cmd (Попытка $iterator)"
         if eval "$cmd"; then
             echo "Команда '$cmd' выполнена успешно!"
@@ -35,445 +56,369 @@ run_with_retry() {
         fi
         echo "Ошибка при выполнении. Повтор через 5 секунд..."
         sleep 5
-        ((iterator++))
+        iterator=$((iterator + 1))
     done
 
     echo "Ошибка: Команда '$cmd' не удалась после $max_attempts попыток."
     return 1
 }
 
+download() {
+    curl -fsSL "$1" -o "$2" || die "не удалось скачать $1"
+}
 
-# Генерация случайных паролей
-GENERIC_SECRET=$(openssl rand -hex 32)
-DB_PASSWORD=$(openssl rand -hex 32)
-COTURN_SECRET=$(openssl rand -hex 32)
-MAS_ENC_KEY=$(openssl rand -hex 32)
+# ---------- работа с .env (без source: файл читается как данные) ----------
 
-# Установка базовых зависимостей
-sudo apt update && sudo apt upgrade -y
-sudo apt install curl git python3 python3-pip wget -y
+env_get() {
+    sed -n "s/^$1=\"\(.*\)\"\$/\1/p" "$ENV_FILE" | tail -n 1
+}
 
-# Создание swap-файла
-sudo fallocate -l 4G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-sudo sysctl vm.swappiness=10
-echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+env_set() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp "$WORK_DIR/env.XXXXXX")"
+    grep -v "^$key=" "$ENV_FILE" > "$tmp" || true
+    printf '%s="%s"\n' "$key" "$value" >> "$tmp"
+    cat "$tmp" > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
 
-# Настройка XRAY
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    # Скачивание JS-скриптов для парсинга VLESS-ссылки (скрипты на базе 3X-UI с адаптацией под серверное выполнение)
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_outbound_parsing.js
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_util.js
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/scripts/dependency/xray_configurator.js
-    # Скачивание шаблона для xray-конфигурации
-    curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.0.0/configs/xray.json
+# ask ПЕРЕМЕННАЯ "подсказка" функция_проверки
+# Берёт значение из .env, если оно там есть; иначе спрашивает и сохраняет.
+ask() {
+    local var="$1" prompt="$2" check="$3" value
+    value="$(env_get "$var")"
+    if [ -z "$value" ]; then
+        while true; do
+            read -r -p "$prompt: " value
+            if "$check" "$value"; then
+                break
+            fi
+            echo "  Некорректное значение, попробуйте ещё раз."
+        done
+        env_set "$var" "$value"
+    fi
+    printf -v "$var" '%s' "$value"
+}
 
-    # Установка Node.js для исполнения js-кода на сервере
-    sudo apt install nodejs npm -y
-    # Универсальный парсинг VLESS ссылки
-    node xray_configurator.js "$VLESS_LINK"
-    # Проверяем, что файл конфигурации создался и он не пустой
-    if [ -s "./config.json" ]; then
-        sudo cp ./config.json /usr/local/etc/xray/config.json
-    else
-        echo "Ошибка: Файл xray-конфига не был создан"
+# Секрет: генерируется один раз и сохраняется в .env
+ensure_secret() {
+    local var="$1" value
+    value="$(env_get "$var")"
+    if [ -z "$value" ]; then
+        value="$(openssl rand -hex 32)"
+        env_set "$var" "$value"
+    fi
+    printf -v "$var" '%s' "$value"
+}
+
+# ---------- проверки ввода ----------
+
+is_ipv4() {
+    local IFS=. o x
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    read -ra o <<< "$1"
+    for x in "${o[@]}"; do
+        [ "$((10#$x))" -le 255 ] || return 1
+    done
+}
+is_domain()   { [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; }
+is_email()    { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
+is_nick()     { [[ "$1" =~ ^[a-z0-9._=-]+$ ]]; }
+is_vless()    { [[ "$1" =~ ^vless:// ]]; }
+is_password() {
+    [ "${#1}" -ge 8 ] || return 1
+    case "$1" in
+        *[[:space:]\'\"\\\$\`!]*) return 1 ;;
+    esac
+    return 0
+}
+
+# ---------- шаг 1: все вопросы сразу, дальше установка идёт без участия ----------
+
+collect_input() {
+    echo "=== Параметры сервера (сохраняются в $ENV_FILE) ==="
+    ask YOUR_IP            "IP (v4) сервера" is_ipv4
+    ask DOMAIN             "Основной домен (например, example.com)" is_domain
+    ask DOMAIN_MATRIX      "Поддомен для Matrix (например, mat.example.com)" is_domain
+    ask DOMAIN_WEB_CLIENT  "Поддомен для Element Web (например, elem.example.com)" is_domain
+    ask DOMAIN_ADMIN_PANEL "Поддомен для Element Admin (например, admin.example.com)" is_domain
+    ask DOMAIN_COTURN      "Поддомен для Coturn (например, turn.example.com)" is_domain
+    ask DOMAIN_CALL        "Поддомен для Element Call (например, call.example.com)" is_domain
+    ask DOMAIN_NTFY        "Поддомен для ntfy (например, ntfy.example.com)" is_domain
+    ask ADMIN_EMAIL        "Email для SSL-уведомлений (Let's Encrypt)" is_email
+
+    NEED_XRAY="$(env_get NEED_XRAY)"
+    if [ -z "$NEED_XRAY" ]; then
+        read -r -p "Ваш сервер находится в РФ и нужен Xray прокси (потребуется vless-ссылка)? [y/N]: " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            NEED_XRAY=yes
+        else
+            NEED_XRAY=no
+        fi
+        env_set NEED_XRAY "$NEED_XRAY"
     fi
 
-    # Установка и настройка Xray
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    sudo mkdir -p /usr/local/share/xray
-    sudo wget https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat -O /usr/local/share/xray/geosite.dat
-    sudo wget https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat -O /usr/local/share/xray/geoip.dat
-    # Запись конфига с подставленными значениями
-    sudo mv ./config.json /usr/local/etc/xray/config.json
-    sudo systemctl restart xray
-    echo "Конфиг обновлен и Xray перезапущен"
+    VLESS_LINK=""
+    if [ "$NEED_XRAY" = yes ]; then
+        ask VLESS_LINK "vless-ссылка (vless://uuid@host:port?params...)" is_vless
+    fi
 
-    # Экспортируем переменные для прокси в ТЕКУЩУЮ сессию скрипта
-    export http_proxy="http://127.0.0.1:10809"
-    export https_proxy="http://127.0.0.1:10809"
-    export ftp_proxy="http://127.0.0.1:10809"
-    export no_proxy="localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
-    export HTTP_PROXY="http://127.0.0.1:10809"
-    export HTTPS_PROXY="http://127.0.0.1:10809"
-    export FTP_PROXY="http://127.0.0.1:10809"
-    export NO_PROXY="localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
+    # Секреты: генерируются один раз, потом берутся из .env
+    ensure_secret GENERIC_SECRET
+    ensure_secret DB_PASSWORD
+    ensure_secret COTURN_SECRET
+    ensure_secret MAS_ENC_KEY
 
-    # Настройка системного прокси через /etc/environment
-    sudo tee /etc/environment <<EOF
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
-http_proxy="http://127.0.0.1:10809"
-https_proxy="http://127.0.0.1:10809"
-ftp_proxy="http://127.0.0.1:10809"
-no_proxy="localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
-HTTP_PROXY="http://127.0.0.1:10809"
-HTTPS_PROXY="http://127.0.0.1:10809"
-FTP_PROXY="http://127.0.0.1:10809"
-NO_PROXY="localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
+    echo "=== Администратор Matrix (в .env не сохраняется) ==="
+    while true; do
+        read -r -p "Логин админа (нижний регистр, латиница/цифры, символы ._=-): " ADMIN_NICK
+        is_nick "$ADMIN_NICK" && break
+        echo "  Некорректный логин."
+    done
+    while true; do
+        read -rs -p "Пароль админа (от 8 символов, без пробелов и знаков ! \" ' \\ \$ \`): " ADMIN_PASS
+        echo
+        is_password "$ADMIN_PASS" && break
+        echo "  Некорректный пароль."
+    done
+}
+
+# ---------- шаг 2: базовые пакеты и swap ----------
+
+install_base() {
+    echo "=== Базовые пакеты ==="
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get upgrade -y
+    apt-get install -y curl git python3 python3-pip wget ufw openssl software-properties-common
+}
+
+setup_swap() {
+    echo "=== Swap ==="
+    if swapon --show=NAME --noheadings | grep -qx /swapfile; then
+        echo "Swap-файл уже включён, пропускаем"
+        return 0
+    fi
+    if [ ! -f /swapfile ]; then
+        fallocate -l 4G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+    fi
+    swapon /swapfile
+    grep -qs '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    # Отдельный файл в sysctl.d: повторный запуск его просто перезапишет
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-matrix-swappiness.conf
+    sysctl -p /etc/sysctl.d/99-matrix-swappiness.conf > /dev/null
+}
+
+# ---------- шаг 3: Xray (только если нужен) ----------
+
+setup_xray() {
+    echo "=== Xray ==="
+    download "$RAW_BASE/scripts/dependency/xray_outbound_parsing.js" "$WORK_DIR/xray_outbound_parsing.js"
+    download "$RAW_BASE/scripts/dependency/xray_util.js" "$WORK_DIR/xray_util.js"
+    download "$RAW_BASE/scripts/dependency/xray_configurator.js" "$WORK_DIR/xray_configurator.js"
+    download "$RAW_BASE/configs/xray.json" "$WORK_DIR/xray.json"
+
+    apt-get install -y nodejs npm
+
+    # Собираем конфиг из vless-ссылки. Ошибка останавливает скрипт здесь, а не уходит в установку.
+    (cd "$WORK_DIR" && node xray_configurator.js "$VLESS_LINK") || die "не удалось собрать конфиг Xray из ссылки"
+    [ -s "$WORK_DIR/config.json" ] || die "файл config.json не создан"
+
+    # Сначала ставим Xray (он создаёт /usr/local/etc/xray), потом кладём конфиг, и только потом запускаем.
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    mkdir -p /usr/local/share/xray
+    run_with_retry "wget -q https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat -O /usr/local/share/xray/geosite.dat"
+    run_with_retry "wget -q https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat -O /usr/local/share/xray/geoip.dat"
+
+    /usr/local/bin/xray run -test -config "$WORK_DIR/config.json" || die "конфиг Xray не прошёл проверку"
+    install -m 644 "$WORK_DIR/config.json" /usr/local/etc/xray/config.json
+    systemctl enable xray
+    systemctl restart xray
+    echo "Xray установлен и запущен"
+}
+
+setup_proxy() {
+    local host_proxy="http://127.0.0.1:${PROXY_PORT}"
+    local no_proxy_list="localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
+
+    # Для текущей сессии скрипта
+    export http_proxy="$host_proxy" https_proxy="$host_proxy" ftp_proxy="$host_proxy" no_proxy="$no_proxy_list"
+    export HTTP_PROXY="$host_proxy" HTTPS_PROXY="$host_proxy" FTP_PROXY="$host_proxy" NO_PROXY="$no_proxy_list"
+
+    # /etc/environment: убираем только строки прокси, остальное сохраняем (раньше файл перезаписывался целиком)
+    local env_tmp
+    env_tmp="$(mktemp "$WORK_DIR/environment.XXXXXX")"
+    grep -viE '^(http|https|ftp|no)_proxy=' /etc/environment > "$env_tmp" || true
+    cat >> "$env_tmp" <<EOF
+http_proxy="$host_proxy"
+https_proxy="$host_proxy"
+ftp_proxy="$host_proxy"
+no_proxy="$no_proxy_list"
+HTTP_PROXY="$host_proxy"
+HTTPS_PROXY="$host_proxy"
+FTP_PROXY="$host_proxy"
+NO_PROXY="$no_proxy_list"
 EOF
+    install -m 644 "$env_tmp" /etc/environment
 
-    # Настройка прокси для Docker
-    sudo mkdir -p /etc/systemd/system/docker.service.d
-    sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf <<EOF
+    # Прокси для докера
+    mkdir -p /etc/systemd/system/docker.service.d
+    cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<EOF
 [Service]
-Environment="HTTP_PROXY=http://172.17.0.1:10809"
-Environment="HTTPS_PROXY=http://172.17.0.1:10809"
+Environment="HTTP_PROXY=http://${DOCKER_BRIDGE_IP}:${PROXY_PORT}"
+Environment="HTTPS_PROXY=http://${DOCKER_BRIDGE_IP}:${PROXY_PORT}"
 Environment="NO_PROXY=localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
 EOF
+}
 
-    # Если Есть прокси, то прописываем его для synapse (PROXY_URL будет использоваться в конфиге vars,yml)
-    PROXY_URL="http://172.17.0.1:10809"
+# ---------- шаг 4: docker, ansible, репозиторий плейбука ----------
+
+install_docker() {
+    echo "=== Docker ==="
+    run_with_retry "curl -fsSL https://get.docker.com | sh"
+    systemctl enable --now docker
+    systemctl daemon-reload
+    systemctl restart docker
+    echo "Подготовка образа Element Admin..."
+    run_with_retry "docker pull oci.element.io/element-admin:latest"
+}
+
+install_ansible() {
+    echo "=== Ansible и just ==="
+    add-apt-repository --yes --update ppa:ansible/ansible
+    if ! command -v just > /dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+    fi
+    apt-get install -y ansible
+}
+
+clone_playbook() {
+    if [ ! -d "$REPO_DIR" ]; then
+        git clone "$PLAYBOOK_REPO" "$REPO_DIR"
+    fi
+    cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
+    run_with_retry "just update"
+}
+
+# ---------- шаг 5: inventory и vars.yml из шаблона ----------
+
+render_inventory() {
+    echo "=== Конфиг ansible ==="
+    mkdir -p "inventory/host_vars/$DOMAIN_MATRIX"
+    printf '[matrix_servers]\n%s ansible_host=127.0.0.1 ansible_connection=local\n' "$DOMAIN_MATRIX" > inventory/hosts
+
+    download "$RAW_BASE/configs/vars.yml" "$WORK_DIR/vars.yml.tpl"
+    local out="inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+
+    python3 - "$WORK_DIR/vars.yml.tpl" "$ENV_FILE" "$out" "$NEED_XRAY" <<'PY' || die "не удалось собрать vars.yml"
+import re
+import sys
+
+template_path, env_path, out_path, need_xray = sys.argv[1:5]
+
+values = {}
+with open(env_path, encoding="utf-8") as f:
+    for line in f:
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)="(.*)"$', line.rstrip("\n"))
+        if m:
+            values[m.group(1)] = m.group(2)
+
+# Блоки между маркерами нужны только при использовании Xray
+keep_xray = need_xray == "yes"
+kept, skipping = [], False
+with open(template_path, encoding="utf-8") as f:
+    for line in f:
+        marker = line.strip()
+        if marker == "# @XRAY_BEGIN":
+            skipping = not keep_xray
+            continue
+        if marker == "# @XRAY_END":
+            skipping = False
+            continue
+        if not skipping:
+            kept.append(line)
+
+text = "".join(kept)
+placeholder = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+missing = sorted({name for name in placeholder.findall(text) if not values.get(name)})
+if missing:
+    sys.exit("В .env не заполнены переменные: " + ", ".join(missing))
+text = placeholder.sub(lambda m: values[m.group(1)], text)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+    chmod 600 "$out"
+}
+
+# ---------- шаг 6: firewall ----------
+
+setup_firewall() {
+    echo "=== Firewall ==="
+    local rule
+    for rule in 22/tcp 80/tcp 443/tcp 3478/tcp 3478/udp 5349/tcp 5349/udp \
+                7880/tcp 7881/tcp 7882/udp 8448/tcp 49152:49652/udp; do
+        ufw allow "$rule"
+    done
+    if [ "$NEED_XRAY" = yes ]; then
+        ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
+        ufw allow from 172.16.0.0/12 to any port "$PROXY_PORT" proto tcp
+    fi
+    ufw --force enable
+}
+
+# ---------- шаг 7: установка плейбука и админ ----------
+
+install_playbook() {
+    echo "Запускаем установку Matrix. Это займет ~30 минут..."
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
+
+    echo "=== Регистрация администратора ==="
+    # Пароль передаётся файлом, а не в командной строке (в командной строке он виден в ps)
+    local vars_file="$WORK_DIR/admin-vars.json"
+    (umask 077 && python3 -c 'import json,sys; print(json.dumps({"username": sys.argv[1], "password": sys.argv[2], "admin": "yes"}))' "$ADMIN_NICK" "$ADMIN_PASS" > "$vars_file")
+    ansible-playbook -i inventory/hosts setup.yml --extra-vars "@$vars_file" --tags=register-user
+}
+
+print_summary() {
+    printf "\n\n\n%s\n\n" "Установка завершена!"
+    if [ "$NEED_XRAY" = yes ]; then
+        printf "Ваш XRAY-конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
+    else
+        printf "Вы отказались от установки XRAY\n\n"
+    fi
+    printf "Ваш ansible-конфиг доступен по пути:\n%s\n\n" "$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+    printf "Ваши параметры и секреты (для повторных запусков):\n%s\n\n" "$ENV_FILE"
+    printf "Команда для повторного запуска ansible (если будете менять конфиг):\n%s\n\n" "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+    printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
+    printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
+    printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
+    printf "Никнейм админа:\n%s\n\n" "$ADMIN_NICK"
+    printf "Пароль админа:\n%s\n\n" "$ADMIN_PASS"
+}
+
+# ---------- главный сценарий ----------
+
+collect_input
+install_base
+setup_swap
+
+if [ "$NEED_XRAY" = yes ]; then
+    setup_xray
+    setup_proxy
 else
     echo "Пропускаем настройку Xray. Прокси не будет использован."
-    # Очищаем переменные прокси, чтобы система не пыталась в них стучаться
-    PROXY_URL=""
-    http_proxy=""
-    https_proxy=""
-    ftp_proxy=""
-    HTTP_PROXY=""
-    FTP_PROXY=""
-    HTTPS_PROXY=""
+    unset http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY
 fi
 
-# Установка докера через официальный скрипт
-run_with_retry "bash <(curl -sSL https://get.docker.com)"
+install_docker
+install_ansible
+clone_playbook
+render_inventory
+setup_firewall
+install_playbook
+print_summary
 
-# Запуск и включение в автозагрузку
-sudo systemctl enable --now docker
-# Перезапуск всех фоновых процессов
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-# ЕСЛИ ставим Element Admin, то:
-echo "Подготовка образа Element Admin..."
-run_with_retry "sudo docker pull oci.element.io/element-admin:latest"
-
-# Установка Ansible и подготовка репозитория
-sudo apt install software-properties-common
-sudo add-apt-repository --yes --update ppa:ansible/ansible
-
-# Официальный скрипт для установки just (если в стандартных репозиториях его нет)
-curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/local/bin
-#ИЛИ
-#echo "deb [signed-by=/usr/share/keyrings/azlux-archive-keyring.gpg] http://packages.azlux.fr/debian/ stable main" | sudo tee /etc/apt/sources.list.d/azlux.list
-#sudo wget -O /usr/share/keyrings/azlux-archive-keyring.gpg https://azlux.fr/repo.gpg
-#sudo apt update
-
-sudo apt install ansible just -y
-
-cd ~ || {
-    printf "\e[31mОшибка: Не удалось перейти в папку текущего пользователя.\e[0m\n"
-    exit 1
-}
-if [ ! -d "matrix-docker-ansible-deploy" ]; then
-    git clone https://github.com/spantaleev/matrix-docker-ansible-deploy.git
-fi
-cd matrix-docker-ansible-deploy || {
-    printf "\e[31mОшибка: Директория matrix-docker-ansible-deploy не найдена. Проверьте, прошел ли git clone.\e[0m\n"
-    exit 1
-}
-
-run_with_retry "just update"
-
-# Создаем каталог для хранения вашей конфигурации
-mkdir -p "inventory/host_vars/$DOMAIN_MATRIX"
-
-# Создание файла hosts
-echo "[matrix_servers]" > inventory/hosts
-echo "$DOMAIN_MATRIX ansible_host=127.0.0.1 ansible_connection=local" >> inventory/hosts
-
-
-# Создание vars.yml с подставленными значениями
-sudo tee "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
----
-
-your_ip: "$YOUR_IP"
-EOF
-
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-your_proxy_http_proxy: "$PROXY_URL"
-your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-authentication-service,matrix-postgres,172.16.0.0/12"
-EOF
-fi
-
-sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-matrix_domain: "$DOMAIN"                                  # ВСТАВИТЬ свой ОСНОВНОЙ ДОМЕН
-matrix_server_fqn_matrix: "$DOMAIN_MATRIX"                # ВСТАВИТЬ свой домен для MATRIX
-coturn_hostname: "$DOMAIN_COTURN"                         # ВСТАВИТЬ свой домен для COTURN (старые звонки 1-на-1)
-matrix_element_call_hostname: "$DOMAIN_CALL"              # ВСТАВИТЬ свой домен для Element Call (современные звонки + групповые)
-ntfy_hostname: "$DOMAIN_NTFY"                             # ВСТАВИТЬ свой домен для NTFY (уведомления)
-matrix_element_admin_hostname: "$DOMAIN_ADMIN_PANEL"      # ВСТАВИТЬ свой домен для Element Admin
-matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ свой домен для Web CLient (Element Web)
-
-
-# Проверка версии плейбука
-matrix_playbook_migration_validated_version: v2026.05.18.0
-
-# Это заставит matrix-клиенты искать настройки по адресу *ваш домен*/.well-known/matrix/client
-matrix_well_known_matrix_client_enabled: true
-
-# Для федерации
-matrix_static_files_container_labels_base_domain_enabled: true
-
-# обратный прокси - traefik - дефолт для этого ansible playbook
-matrix_playbook_reverse_proxy_type: playbook-managed-traefik
-traefik_config_certificatesResolvers_acme_email: '$ADMIN_EMAIL'   # ВСТАВИТЬ EMAIL ДЛЯ ИНФОРМАЦИИ ОБ SSL СЕРТИФИКАТОВ ОТ  LET'S ENCRYPT
-
-# Настройки для Synapse
-matrix_homeserver_implementation: synapse
-matrix_homeserver_generic_secret_key: '$GENERIC_SECRET'           # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для матрикс-сервера)
-
-# Глобальный таймаут Ansible (время ожидания ответа от системы)
-# Время, которое дается systemd для перезапуска сервисов (секунды)
-devture_systemd_service_manager_up_verification_delay_seconds: 600
-# Количество попыток повторить запуск сервисов
-devture_systemd_service_manager_all_at_once_retries: 5
-# Количество секунд между попытками перезапустить сервисы
-devture_systemd_service_manager_all_at_once_retry_delay_seconds: 30
-
-postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
-
-# (Если у вас сервер - Synapse и не используется MAS, то настраиваем это на true)
-# true Включает возможность самостоятельной регистрации
-matrix_synapse_enable_registration: false
-# Капча (требует доп. настройки поставщика капчи)
-matrix_synapse_enable_registration_captcha: false
-# Разрешает регистрационные токены Synapse (у MAS свои токены и настройка для них)
-matrix_synapse_registration_requires_token: false
-# Ограничение на размер скачиваемых файлов (число в мегабайтах, по дефолту было 50мб)
-matrix_synapse_max_upload_size_mb: 2048
-
-# Поиск пользователей
-
-# Определяет, кого Synapse вообще включает в поисковый индекс.
-# false: В поиске появятся только те пользователи,
-#    с которыми у вас есть общие комнаты.
-# true: В поиске будут доступны все зарегистрированные пользователи вашего сервера,
-#    даже если вы с ними никак не пересекались.
-matrix_synapse_user_directory_search_all_users: true
-# Влияет на ранжирование (порядок выдачи) в результатах поиска.
-# false: Результаты сортируются по релевантности (совпадению букв),
-#    без приоритета места регистрации.
-# true: Ваши «местные» пользователи (зарегистрированные на @ваш-домен.com)
-#    будут всегда отображаться вверху списка, даже если есть более точные совпадения с пользователями
-#    из других серверов (федерации).
-matrix_synapse_user_directory_prefer_local_users: true
-# Фильтр-отсечка для внешней федерации.
-# false: В поиске могут появляться пользователи с других серверов
-#    (если ваш сервер о них знает, например, через общие комнаты).
-# true: Полностью запрещает показ любых пользователей в поиске c других серверов.
-#    Вы будете видеть только тех, кто зарегистрирован лично на вашем сервере.
-matrix_synapse_user_directory_exclude_remote_users: false
-
-# Срок жизни медиа-файлов ВАШЕГО сервера от ваших пользователей (пусто = файлы живут вечно)
-matrix_synapse_media_retention_local_media_lifetime:
-# Срок жизни медиа-файлов со СТОРОННИХ серверов от других пользователей.
-# Настройка: 7 дней - 7d, 2 недели - 2w, 1 месяц - 1m, 1 год - 1y
-matrix_synapse_media_retention_remote_media_lifetime: 2w
-
-# ntfy для уведомлений
-ntfy_enabled: true
-EOF
-
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-# Для ntfy Настройки прокси и DNS
-ntfy_container_extra_arguments:
-  - "--env"
-  - "http_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  - "https_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  - "no_proxy={{ your_proxy_no_proxy }}"
-  - "--dns"
-  - "127.0.0.11"
-EOF
-fi
-
-
-sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-# Явно говорим synapse где искать локальный ntfy
-matrix_synapse_container_extra_hosts:
-  - "{{ ntfy_hostname }}:host-gateway"
-
-# Для Synapse настройки прокси, DNS и уведомления
-matrix_synapse_container_extra_arguments:
-  - "--add-host={{ ntfy_hostname }}:host-gateway"
-EOF
-
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-  - "--env"
-  - "http_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  - "https_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  # Без прокси: все локальные адреса, ваши домены,
-  #  матрикс-контейнеры, которые могут общаться между собой по https (например Synapse <-> MAS) и все локальные адреса докера
-  - "no_proxy={{ your_proxy_no_proxy }}"
-  # Внутренний DNS докера
-  - "--dns"
-  - "127.0.0.11"
-EOF
-fi
-
-sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-# Дополнительные настройки Synapse
-matrix_synapse_configuration_extension_yaml: |
-  #Список комнат, в которые пользователь попадет сразу после регистрации
-  #auto_join_rooms:
-  #  - "#your-room:your-server.com"
-  #белые списки Synapse чтобы он мог обращаться к другим сервисам по локальному ip (важно для работающих уведомлений)
-  ip_range_whitelist:
-    - "172.16.0.0/12"
-    - "10.0.0.0/8"
-    - "127.0.0.0/8"
-    - "192.168.0.0/16"
-
-# Настраиваем ограничения сервера synapse чтобы не нагружать процессор огромными matrix-комнатами
-matrix_synapse_limit_remote_rooms_enabled: true
-matrix_synapse_limit_remote_rooms_complexity: 15.0
-matrix_synapse_limit_remote_rooms_complexity_error: "Наш сервер не может подключаться к таким большим/тяжелым комнатам."
-matrix_synapse_limit_remote_rooms_admins_can_join: false
-# Если false - Убирает опросы online/offline - важно при федерации, иначе CPU будет постоянно нагружен
-matrix_synapse_presence_enabled: false
-
-# Звонки p2p
-coturn_enabled: true
-coturn_turn_external_ip_addresses: ["{{ your_ip }}"]
-coturn_turn_static_auth_secret: "$COTURN_SECRET"                   # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для звонков через coturn)
-coturn_turn_udp_min_port: 49152
-coturn_turn_udp_max_port: 49652
-
-# Групповые звонки через Element Call (livekit)
-matrix_rtc_enabled: true
-matrix_element_call_enabled: true
-matrix_client_element_jitsi_preferred: false
-matrix_client_element_voip_conference_type: "livekit"
-# Принуждаем LiveKit работать корректно через TCP, если UDP блокируют
-livekit_server_config_turn_external_tls: true
-livekit_server_configuration_extension_yaml: |
-  rtc:
-    force_tcp: true
-  # Сообщаем lk-jwt-service о выходе участников, иначе он бесконечно продлевает
-  # отложенное событие выхода (MSC4140) и сессия в звонке "зависает".
-  webhook:
-    api_key: "{{ matrix_livekit_jwt_service_environment_variable_livekit_key }}"
-    urls:
-      - "http://matrix-livekit-jwt-service:8080/sfu_webhook"
-
-# Запасной механизм: периодически проверять, что участник ещё есть на SFU.
-matrix_livekit_jwt_service_environment_variables_extension: |
-  LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS=60
-
-# Если сервер не знает своего внешнего IP, пакеты застревают
-livekit_rtc_use_external_ip: true
-livekit_rtc_external_ip: "{{ your_ip }}"
-
-# Админка Element Admin
-matrix_element_admin_enabled: true
-
-
-# Настройка Matrix Authentication Service (MAS)
-matrix_authentication_service_enabled: true
-matrix_authentication_service_config_secrets_encryption: "$MAS_ENC_KEY"     # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ для MAS
-# Если вы переносите авторизацию с обычного способа на MAS, то нужно поставить true
-matrix_authentication_service_migration_in_progress: false
-
-# Позволяет пользователям логиниться, используя email вместо username (удобно для сброса, но нужно настраивать отдельно)
-matrix_authentication_service_config_account_login_with_email_allowed: false
-# Включаем возможность регистрации по паролю, а не только через сторонних auth-поставщиков
-matrix_authentication_service_config_account_password_registration_enabled: true
-# Требовать токен для регистрации
-matrix_authentication_service_config_account_password_registration_token_required: true
-# Требовать email при регистрации
-matrix_authentication_service_config_account_password_registration_email_required: false
-# Позволяет пользователям самостоятельно Сбрасывать пароль по почте (нужно настроить работу с почтой на вашем сервере)
-matrix_authentication_service_config_account_password_recovery_enabled: false
-# Позволяет пользователям самостоятельно Менять пароль в настройках
-matrix_authentication_service_config_account_password_change_allowed: true
-EOF
-
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-    sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-# Настройки прокси для MAS
-matrix_authentication_service_container_extra_arguments:
-  - "--env"
-  - "http_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  - "https_proxy={{ your_proxy_http_proxy }}"
-  - "--env"
-  # Без прокси: все локальные адреса, ваши домены,
-  #  матрикс-контейнеры, которые могут общаться между собой по https (например Synapse <-> MAS) и все локальные адреса докера
-  - "no_proxy={{ your_proxy_no_proxy }}"
-  # Внутренний DNS докера
-  - "--dns"
-  - "127.0.0.11"
-EOF
-fi
-
-sudo tee -a "inventory/host_vars/$DOMAIN_MATRIX/vars.yml" <<EOF > /dev/null
-# Web-client Element
-matrix_client_element_enabled: true
-# Стандартный телефонный код (+7)
-matrix_client_element_default_country_code: "RU"
-# Темы оформления из репозитория
-matrix_client_element_themes_enabled: true
-matrix_client_element_themes_repository_url: "https://github.com/aaronraimist/element-themes"
-# Включение сторонних тем по ссылке
-matrix_client_element_setting_defaults_custom_themes_enabled: true
-matrix_client_element_configuration_extension_json: |
-  {
-    "csp": {
-      "style-src": ["'self'", "'unsafe-inline'", "https://*"],
-      "img-src": ["'self'", "data:", "blob:", "https://*"],
-      "connect-src": ["'self'", "https://*", "wss://*"]
-    }
-  }
-EOF
-
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw allow 3478/tcp
-sudo ufw allow 3478/udp
-sudo ufw allow 5349/tcp
-sudo ufw allow 5349/udp
-sudo ufw allow 7880/tcp
-sudo ufw allow 7881/tcp
-sudo ufw allow 7882/udp
-sudo ufw allow 8448/tcp
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-sudo ufw allow from 172.16.0.0/12 to any port 10808 proto tcp
-sudo ufw allow from 172.16.0.0/12 to any port 10809 proto tcp
-fi
-sudo ufw allow 49152:49652/udp
-sudo ufw --force enable
-
-# Запуск установки
-echo "Запускаем установку Matrix. Это займет ~30 минут..."
-run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
-
-# Регистрация администратора
-ansible-playbook -i inventory/hosts setup.yml --extra-vars="username=$ADMIN_NICK password=$ADMIN_PASS admin=yes" --tags=register-user
-
-printf "\n\n\n%s\n\n" "Установка завершена!"
-if [[ "$NEED_XRAY" =~ ^[Yy]$ ]]; then
-  printf "Ваш XRAY-конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
-else
-  printf "Вы отказались от установки XRAY\n\n"
-fi
-
-printf "Ваш ansible-конфиг доступен по пути:\n%s\n\n" "$HOME/matrix-docker-ansible-deploy/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
-printf "Команда для повторного запуска ansible (если будете менять конфиг):\n%s\n\n" "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
-printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
-printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
-printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
-printf "Никнейм админа:\n%s\n\n" "$ADMIN_NICK"
-printf "Пароль админа:\n%s\n\n" "$ADMIN_PASS"
-
-unset ADMIN_NICK
-unset ADMIN_PASS
+unset ADMIN_NICK ADMIN_PASS

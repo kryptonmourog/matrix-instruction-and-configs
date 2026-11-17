@@ -1,15 +1,23 @@
+---
+# ШАБЛОН. Его берёт scripts/matrix_up.sh и подставляет значения из .env (рядом со скриптом).
+# ${ПЕРЕМЕННАЯ} заменяется на значение из .env.
+# Блоки между "# @XRAY_BEGIN" и "# @XRAY_END" попадают в итоговый файл только если нужен Xray.
+# Не редактируйте сгенерированный vars.yml на сервере: меняйте .env и запускайте ansible заново.
 
-your_ip: "$YOUR_IP"
+your_ip: "${YOUR_IP}"
+
+# @XRAY_BEGIN
 your_proxy_http_proxy: "http://172.17.0.1:10809"
 your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-livekit-server,matrix-authentication-service,matrix-postgres,172.16.0.0/12"
+# @XRAY_END
 
-matrix_domain: "$DOMAIN"                                  # ВСТАВИТЬ свой ОСНОВНОЙ ДОМЕН
-matrix_server_fqn_matrix: "$DOMAIN_MATRIX"                # ВСТАВИТЬ свой домен для MATRIX
-coturn_hostname: "$DOMAIN_COTURN"                         # ВСТАВИТЬ свой домен для COTURN (старые звонки 1-на-1)
-matrix_element_call_hostname: "$DOMAIN_CALL"              # ВСТАВИТЬ свой домен для Element Call (современные звонки + групповые)
-ntfy_hostname: "$DOMAIN_NTFY"                             # ВСТАВИТЬ свой домен для NTFY (уведомления)
-matrix_element_admin_hostname: "$DOMAIN_ADMIN_PANEL"      # ВСТАВИТЬ свой домен для Element Admin
-matrix_server_fqn_element: "$DOMAIN_WEB_CLIENT"           # ВСТАВИТЬ свой домен для Web CLient (Element Web)
+matrix_domain: "${DOMAIN}"                                  # ВСТАВИТЬ свой ОСНОВНОЙ ДОМЕН
+matrix_server_fqn_matrix: "${DOMAIN_MATRIX}"                # ВСТАВИТЬ свой домен для MATRIX
+coturn_hostname: "${DOMAIN_COTURN}"                         # ВСТАВИТЬ свой домен для COTURN (старые звонки 1-на-1)
+matrix_element_call_hostname: "${DOMAIN_CALL}"              # ВСТАВИТЬ свой домен для Element Call (современные звонки + групповые)
+ntfy_hostname: "${DOMAIN_NTFY}"                             # ВСТАВИТЬ свой домен для NTFY (уведомления)
+matrix_element_admin_hostname: "${DOMAIN_ADMIN_PANEL}"      # ВСТАВИТЬ свой домен для Element Admin
+matrix_server_fqn_element: "${DOMAIN_WEB_CLIENT}"           # ВСТАВИТЬ свой домен для Web CLient (Element Web)
 
 
 # Проверка версии плейбука
@@ -23,11 +31,11 @@ matrix_static_files_container_labels_base_domain_enabled: true
 
 # обратный прокси - traefik - дефолт для этого ansible playbook
 matrix_playbook_reverse_proxy_type: playbook-managed-traefik
-traefik_config_certificatesResolvers_acme_email: '$ADMIN_EMAIL'   # ВСТАВИТЬ EMAIL ДЛЯ ИНФОРМАЦИИ ОБ SSL СЕРТИФИКАТОВ ОТ  LET'S ENCRYPT
+traefik_config_certificatesResolvers_acme_email: '${ADMIN_EMAIL}'   # EMAIL ДЛЯ ИНФОРМАЦИИ ОБ SSL СЕРТИФИКАТОВ ОТ LET'S ENCRYPT
 
 # Настройки для Synapse
 matrix_homeserver_implementation: synapse
-matrix_homeserver_generic_secret_key: '$GENERIC_SECRET'           # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для матрикс-сервера)
+matrix_homeserver_generic_secret_key: '${GENERIC_SECRET}'         # секретный ключ (для матрикс-сервера)
 
 # Глобальный таймаут Ansible (время ожидания ответа от системы)
 # Время, которое дается systemd для перезапуска сервисов (секунды)
@@ -37,7 +45,7 @@ devture_systemd_service_manager_all_at_once_retries: 5
 # Количество секунд между попытками перезапустить сервисы
 devture_systemd_service_manager_all_at_once_retry_delay_seconds: 30
 
-postgres_connection_password: '$DB_PASSWORD'                      # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ ДЛЯ БД
+postgres_connection_password: '${DB_PASSWORD}'                    # пароль для БД
 
 # (Если у вас сервер - Synapse и не используется MAS, то настраиваем это на true)
 # true Включает возможность самостоятельной регистрации
@@ -79,6 +87,8 @@ matrix_synapse_media_retention_remote_media_lifetime: 2w
 
 # ntfy для уведомлений
 ntfy_enabled: true
+
+# @XRAY_BEGIN
 # Для ntfy Настройки прокси и DNS
 ntfy_container_extra_arguments:
   - "--env"
@@ -89,6 +99,7 @@ ntfy_container_extra_arguments:
   - "no_proxy={{ your_proxy_no_proxy }}"
   - "--dns"
   - "127.0.0.11"
+# @XRAY_END
 
 # Явно говорим synapse где искать локальный ntfy
 matrix_synapse_container_extra_hosts:
@@ -97,6 +108,7 @@ matrix_synapse_container_extra_hosts:
 # Для Synapse настройки прокси, DNS и уведомления
 matrix_synapse_container_extra_arguments:
   - "--add-host={{ ntfy_hostname }}:host-gateway"
+# @XRAY_BEGIN
   - "--env"
   - "http_proxy={{ your_proxy_http_proxy }}"
   - "--env"
@@ -108,6 +120,7 @@ matrix_synapse_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+# @XRAY_END
 
 # Дополнительные настройки Synapse
 matrix_synapse_configuration_extension_yaml: |
@@ -132,7 +145,7 @@ matrix_synapse_presence_enabled: false
 # Звонки p2p
 coturn_enabled: true
 coturn_turn_external_ip_addresses: ["{{ your_ip }}"]
-coturn_turn_static_auth_secret: "$COTURN_SECRET"                   # ВСТАВИТЬ КАКОЙ-ТО СЕКРЕТНЫЙ КЛЮЧ (для звонков через coturn)
+coturn_turn_static_auth_secret: "${COTURN_SECRET}"                 # секретный ключ (для звонков через coturn)
 coturn_turn_udp_min_port: 49152
 coturn_turn_udp_max_port: 49652
 
@@ -169,7 +182,7 @@ matrix_element_admin_enabled: true
 
 # Настройка Matrix Authentication Service (MAS)
 matrix_authentication_service_enabled: true
-matrix_authentication_service_config_secrets_encryption: "$MAS_ENC_KEY"     # ВСТАВИТЬ КАКОЙ-ТО ПАРОЛЬ для MAS
+matrix_authentication_service_config_secrets_encryption: "${MAS_ENC_KEY}"  # ключ шифрования для MAS
 # Если вы переносите авторизацию с обычного способа на MAS, то нужно поставить true
 matrix_authentication_service_migration_in_progress: false
 
@@ -186,6 +199,7 @@ matrix_authentication_service_config_account_password_recovery_enabled: false
 # Позволяет пользователям самостоятельно Менять пароль в настройках
 matrix_authentication_service_config_account_password_change_allowed: true
 
+# @XRAY_BEGIN
 # Настройки прокси для MAS
 matrix_authentication_service_container_extra_arguments:
   - "--env"
@@ -199,6 +213,7 @@ matrix_authentication_service_container_extra_arguments:
   # Внутренний DNS докера
   - "--dns"
   - "127.0.0.11"
+# @XRAY_END
 
 
 # Web-client Element
