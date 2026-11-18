@@ -2,7 +2,10 @@
 # ШАБЛОН. Его берёт scripts/matrix_up.sh и подставляет значения из .env (рядом со скриптом).
 # ${ПЕРЕМЕННАЯ} заменяется на значение из .env.
 # Блоки между "# @XRAY_BEGIN" и "# @XRAY_END" попадают в итоговый файл только если нужен Xray.
-# Не редактируйте сгенерированный vars.yml на сервере: меняйте .env и запускайте ansible заново.
+# Сгенерированный vars.yml можно править вручную и применять командой
+#   cd <каталог плейбука> && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start
+# Но повторный запуск matrix_up.sh пересоздаёт vars.yml из этого шаблона (прошлый файл
+# сохраняется рядом как vars.yml.bak-ДАТА), и ручные правки придётся перенести заново.
 
 your_ip: "${YOUR_IP}"
 
@@ -174,7 +177,7 @@ matrix_livekit_jwt_service_environment_variables_extension: |
 livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
-# Админка Ketesa (бывший synapse-admin от etke.cc ( доступ: *ваш хост*/ketesa )
+# Админка Ketesa (бывший synapse-admin от etke.cc), доступ: https://<домен Matrix>/synapse-admin/
 matrix_ketesa_enabled: true
 # Админка Element Admin
 matrix_element_admin_enabled: true

@@ -4,33 +4,42 @@
 # Значения берутся из файла .env рядом со скриптом. Недостающие значения спрашиваются
 # и сохраняются в .env. Секреты генерируются один раз и тоже сохраняются, поэтому
 # повторный запуск не меняет пароль БД и ключи уже установленного сервера.
+# Если на сервере уже есть установка (в том числе сделанная версией v1.0.0),
+# значения и секреты берутся из её vars.yml.
 # Шаблон конфига ansible (configs/vars.yml) скачивается из репозитория и заполняется из .env.
 #
 # Запуск: sudo ./matrix_up.sh
 
 set -euo pipefail
 
-RAW_BASE="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.1.0"
+RELEASE_TAG="v1.1.1"
+RAW_BASE="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/${RELEASE_TAG}"
 PLAYBOOK_REPO="https://github.com/spantaleev/matrix-docker-ansible-deploy.git"
+# У плейбука нет git-тегов, поэтому он фиксируется по коммиту, на котором проверен этот релиз.
+# PLAYBOOK_VERSION должна совпадать с matrix_playbook_migration_validated_version в configs/vars.yml.
+PLAYBOOK_COMMIT="53bf00e192e971b72bb62c0d28f0d5599eb97cae"
+PLAYBOOK_VERSION="v2026.05.18.0"
 PROXY_PORT=10809
 DOCKER_BRIDGE_IP="172.17.0.1"
 
 RED='\e[31m'
+YELLOW='\e[33m'
 NC='\e[0m'
 die() {
     printf "${RED}Ошибка: %s${NC}\n" "$*" >&2
     exit 1
+}
+warn() {
+    printf "${YELLOW}Внимание: %s${NC}\n" "$*" >&2
 }
 
 if [ "$(id -u)" -ne 0 ]; then
     die "запустите скрипт через sudo: sudo ./matrix_up.sh"
 fi
 
-# Домашний каталог того, кто запустил sudo (а не /root)
 TARGET_USER="${SUDO_USER:-root}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [ -n "$TARGET_HOME" ] || die "не удалось определить домашний каталог пользователя $TARGET_USER"
-REPO_DIR="$TARGET_HOME/matrix-docker-ansible-deploy"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
@@ -39,23 +48,25 @@ ENV_FILE="$SCRIPT_DIR/.env"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-touch "$ENV_FILE"
+touch "$ENV_FILE" || die "не удалось создать $ENV_FILE. Скачайте скрипт в обычную папку (curl -O ...) и запустите его оттуда"
 chmod 600 "$ENV_FILE"
 
-# Функция для запуска тяжелых команд с несколькими попытками
+# run_with_retry "команда" [число попыток, по умолчанию 15]
 run_with_retry() {
-    local max_attempts=15
-    local iterator=1
     local cmd="$1"
+    local max_attempts="${2:-15}"
+    local iterator=1
 
     while [ "$iterator" -le "$max_attempts" ]; do
-        echo "Запуск: $cmd (Попытка $iterator)"
+        echo "Запуск: $cmd (Попытка $iterator из $max_attempts)"
         if eval "$cmd"; then
             echo "Команда '$cmd' выполнена успешно!"
             return 0
         fi
-        echo "Ошибка при выполнении. Повтор через 5 секунд..."
-        sleep 5
+        if [ "$iterator" -lt "$max_attempts" ]; then
+            echo "Ошибка при выполнении. Повтор через 5 секунд..."
+            sleep 5
+        fi
         iterator=$((iterator + 1))
     done
 
@@ -82,14 +93,17 @@ env_set() {
     chmod 600 "$ENV_FILE"
 }
 
-# ask ПЕРЕМЕННАЯ "подсказка" функция_проверки
+# ask ПЕРЕМЕННАЯ "подсказка" функция_проверки [функция_нормализации]
 # Берёт значение из .env, если оно там есть; иначе спрашивает и сохраняет.
 ask() {
-    local var="$1" prompt="$2" check="$3" value
+    local var="$1" prompt="$2" check="$3" normalize="${4:-}" value
     value="$(env_get "$var")"
     if [ -z "$value" ]; then
         while true; do
             read -r -p "$prompt: " value
+            if [ -n "$normalize" ]; then
+                value="$("$normalize" "$value")"
+            fi
             if "$check" "$value"; then
                 break
             fi
@@ -111,7 +125,17 @@ ensure_secret() {
     printf -v "$var" '%s' "$value"
 }
 
-# ---------- проверки ввода ----------
+# ---------- проверки и нормализация ввода ----------
+
+# Нижний регистр, без точки в конце; кириллический домен (пример.рф) переводится в punycode.
+normalize_domain() {
+    local d="${1,,}"
+    d="${d%.}"
+    if [[ "$d" =~ [^a-z0-9.-] ]] && command -v python3 > /dev/null 2>&1; then
+        d="$(python3 -c 'import sys; print(sys.argv[1].encode("idna").decode())' "$d" 2> /dev/null)" || d=""
+    fi
+    printf '%s' "$d"
+}
 
 is_ipv4() {
     local IFS=. o x
@@ -121,16 +145,116 @@ is_ipv4() {
         [ "$((10#$x))" -le 255 ] || return 1
     done
 }
-is_domain()   { [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; }
-is_email()    { [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
+# TLD: обычный (com, ru) или punycode (xn--p1ai для .рф)
+is_domain()   { [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9-]+)$ ]]; }
+is_email()    { [[ "$1" =~ ^[^@[:space:]\'\"]+@[^@[:space:]\'\"]+\.[^@[:space:]\'\"]+$ ]]; }
 is_nick()     { [[ "$1" =~ ^[a-z0-9._=-]+$ ]]; }
 is_vless()    { [[ "$1" =~ ^vless:// ]]; }
+# MAS отклоняет простые пароли, поэтому требуем длину и разные типы символов.
+# Это не гарантия: окончательное решение принимает MAS при регистрации.
 is_password() {
-    [ "${#1}" -ge 8 ] || return 1
-    case "$1" in
-        *[[:space:]\'\"\\\$\`!]*) return 1 ;;
-    esac
+    [ "${#1}" -ge 12 ] || return 1
+    [[ "$1" =~ [a-z] ]] || return 1
+    [[ "$1" =~ [A-Z] ]] || return 1
+    [[ "$1" =~ [0-9] ]] || return 1
+    [[ "$1" =~ [[:space:]] ]] && return 1
     return 0
+}
+
+# ---------- шаг 0: существующая установка ----------
+
+# Плейбук от прошлых запусков: v1.0.0 под sudo клонировал в /root, v1.1.0 — в домашний каталог.
+# Берём каталог, где уже есть конфиг, чтобы не завести вторую копию с другими секретами.
+find_repo_dir() {
+    local d
+    for d in "$TARGET_HOME/matrix-docker-ansible-deploy" "/root/matrix-docker-ansible-deploy"; do
+        if compgen -G "$d/inventory/host_vars/*/vars.yml" > /dev/null; then
+            echo "$d"
+            return
+        fi
+    done
+    for d in "$TARGET_HOME/matrix-docker-ansible-deploy" "/root/matrix-docker-ansible-deploy"; do
+        if [ -d "$d/.git" ]; then
+            echo "$d"
+            return
+        fi
+    done
+    echo "$TARGET_HOME/matrix-docker-ansible-deploy"
+}
+
+# Переносит значения и секреты из vars.yml прошлой установки в .env (только отсутствующие в .env).
+# Без этого повторный запуск сгенерировал бы новые пароль БД и ключи и сломал бы Postgres и MAS.
+import_existing_vars() {
+    local files=() existing key value
+    if compgen -G "$REPO_DIR/inventory/host_vars/*/vars.yml" > /dev/null; then
+        files=("$REPO_DIR"/inventory/host_vars/*/vars.yml)
+    fi
+    [ "${#files[@]}" -gt 0 ] || return 0
+    if [ "${#files[@]}" -gt 1 ]; then
+        warn "в $REPO_DIR/inventory/host_vars несколько конфигов, значения из них автоматически не переносятся"
+        require_secrets_in_env "$REPO_DIR/inventory/host_vars"
+        return 0
+    fi
+    existing="${files[0]}"
+    command -v python3 > /dev/null 2>&1 || die "найдена прошлая установка ($existing), но для переноса её настроек нужен python3"
+
+    echo "=== Найдена прошлая установка: $existing ==="
+    echo "Её домены и секреты переносятся в $ENV_FILE, пароль БД и ключи не изменятся."
+    local imported="$WORK_DIR/imported.tsv"
+    python3 - "$existing" > "$imported" <<'PY' || die "не удалось прочитать $existing"
+import re
+import sys
+
+mapping = {
+    "your_ip": "YOUR_IP",
+    "matrix_domain": "DOMAIN",
+    "matrix_server_fqn_matrix": "DOMAIN_MATRIX",
+    "matrix_server_fqn_element": "DOMAIN_WEB_CLIENT",
+    "matrix_element_admin_hostname": "DOMAIN_ADMIN_PANEL",
+    "coturn_hostname": "DOMAIN_COTURN",
+    "matrix_element_call_hostname": "DOMAIN_CALL",
+    "ntfy_hostname": "DOMAIN_NTFY",
+    "traefik_config_certificatesResolvers_acme_email": "ADMIN_EMAIL",
+    "matrix_homeserver_generic_secret_key": "GENERIC_SECRET",
+    "postgres_connection_password": "DB_PASSWORD",
+    "coturn_turn_static_auth_secret": "COTURN_SECRET",
+    "matrix_authentication_service_config_secrets_encryption": "MAS_ENC_KEY",
+}
+line_re = re.compile(r"""^([A-Za-z_][A-Za-z0-9_]*):\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
+found = {}
+uses_proxy = False
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        m = line_re.match(line)
+        if not m:
+            continue
+        key = m.group(1)
+        value = next((g for g in m.groups()[1:] if g is not None), "")
+        if key == "your_proxy_http_proxy" and value:
+            uses_proxy = True
+        if key in mapping and value and "{{" not in value and "$" not in value and '"' not in value:
+            found[mapping[key]] = value
+found["NEED_XRAY"] = "yes" if uses_proxy else "no"
+for key, value in found.items():
+    print(f"{key}\t{value}")
+PY
+    while IFS=$'\t' read -r key value; do
+        [ -n "$value" ] || continue
+        if [ -z "$(env_get "$key")" ]; then
+            env_set "$key" "$value"
+        fi
+    done < "$imported"
+
+    require_secrets_in_env "$existing"
+}
+
+# Новый секрет при существующей установке сломает Postgres или MAS, поэтому не генерируем его, а останавливаемся
+require_secrets_in_env() {
+    local source="$1" key
+    for key in GENERIC_SECRET DB_PASSWORD COTURN_SECRET MAS_ENC_KEY; do
+        [ -n "$(env_get "$key")" ] \
+            || die "на сервере есть прошлая установка ($source), но значение $key не найдено. Чтобы не сломать её, впишите его в $ENV_FILE вручную (формат: $key=\"значение\") и запустите скрипт снова"
+    done
 }
 
 # ---------- шаг 1: все вопросы сразу, дальше установка идёт без участия ----------
@@ -138,13 +262,13 @@ is_password() {
 collect_input() {
     echo "=== Параметры сервера (сохраняются в $ENV_FILE) ==="
     ask YOUR_IP            "IP (v4) сервера" is_ipv4
-    ask DOMAIN             "Основной домен (например, example.com)" is_domain
-    ask DOMAIN_MATRIX      "Поддомен для Matrix (например, mat.example.com)" is_domain
-    ask DOMAIN_WEB_CLIENT  "Поддомен для Element Web (например, elem.example.com)" is_domain
-    ask DOMAIN_ADMIN_PANEL "Поддомен для Element Admin (например, admin.example.com)" is_domain
-    ask DOMAIN_COTURN      "Поддомен для Coturn (например, turn.example.com)" is_domain
-    ask DOMAIN_CALL        "Поддомен для Element Call (например, call.example.com)" is_domain
-    ask DOMAIN_NTFY        "Поддомен для ntfy (например, ntfy.example.com)" is_domain
+    ask DOMAIN             "Основной домен (например, example.com)" is_domain normalize_domain
+    ask DOMAIN_MATRIX      "Поддомен для Matrix (например, mat.example.com)" is_domain normalize_domain
+    ask DOMAIN_WEB_CLIENT  "Поддомен для Element Web (например, elem.example.com)" is_domain normalize_domain
+    ask DOMAIN_ADMIN_PANEL "Поддомен для Element Admin (например, admin.example.com)" is_domain normalize_domain
+    ask DOMAIN_COTURN      "Поддомен для Coturn (например, turn.example.com)" is_domain normalize_domain
+    ask DOMAIN_CALL        "Поддомен для Element Call (например, call.example.com)" is_domain normalize_domain
+    ask DOMAIN_NTFY        "Поддомен для ntfy (например, ntfy.example.com)" is_domain normalize_domain
     ask ADMIN_EMAIL        "Email для SSL-уведомлений (Let's Encrypt)" is_email
 
     NEED_XRAY="$(env_get NEED_XRAY)"
@@ -176,10 +300,15 @@ collect_input() {
         echo "  Некорректный логин."
     done
     while true; do
-        read -rs -p "Пароль админа (от 8 символов, без пробелов и знаков ! \" ' \\ \$ \`): " ADMIN_PASS
+        read -rs -p "Пароль админа (от 12 символов, строчные и заглавные буквы и цифры; Enter — сгенерировать): " ADMIN_PASS
         echo
+        if [ -z "$ADMIN_PASS" ]; then
+            ADMIN_PASS="$(openssl rand -base64 24 | tr -d '+/=\n')"
+            echo "  Пароль сгенерирован, он будет показан в конце установки."
+            break
+        fi
         is_password "$ADMIN_PASS" && break
-        echo "  Некорректный пароль."
+        echo "  Слишком простой пароль: нужно от 12 символов, строчные и заглавные буквы, цифры, без пробелов."
     done
 }
 
@@ -247,7 +376,7 @@ setup_proxy() {
     export http_proxy="$host_proxy" https_proxy="$host_proxy" ftp_proxy="$host_proxy" no_proxy="$no_proxy_list"
     export HTTP_PROXY="$host_proxy" HTTPS_PROXY="$host_proxy" FTP_PROXY="$host_proxy" NO_PROXY="$no_proxy_list"
 
-    # /etc/environment: убираем только строки прокси, остальное сохраняем (раньше файл перезаписывался целиком)
+    # /etc/environment: убираем только строки прокси, остальное сохраняем
     local env_tmp
     env_tmp="$(mktemp "$WORK_DIR/environment.XXXXXX")"
     grep -viE '^(http|https|ftp|no)_proxy=' /etc/environment > "$env_tmp" || true
@@ -294,12 +423,30 @@ install_ansible() {
     apt-get install -y ansible
 }
 
+# Плейбук фиксируется на PLAYBOOK_COMMIT. Уже установленный плейбук новее этой версии
+# не откатывается: откат может сломать базу данных Synapse.
 clone_playbook() {
-    if [ ! -d "$REPO_DIR" ]; then
-        git clone "$PLAYBOOK_REPO" "$REPO_DIR"
+    echo "=== Плейбук matrix-docker-ansible-deploy ==="
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        [ ! -e "$REPO_DIR" ] || die "$REPO_DIR существует, но это не git-репозиторий. Переименуйте его и запустите скрипт снова"
+        local partial="$REPO_DIR.partial"
+        run_with_retry "rm -rf '$partial' && git clone -q '$PLAYBOOK_REPO' '$partial'"
+        mv "$partial" "$REPO_DIR"
+        git -C "$REPO_DIR" checkout -q "$PLAYBOOK_COMMIT"
+        echo "Плейбук зафиксирован на коммите $PLAYBOOK_COMMIT ($PLAYBOOK_VERSION)"
+    else
+        run_with_retry "git -C '$REPO_DIR' fetch -q origin"
+        if git -C "$REPO_DIR" merge-base --is-ancestor "$PLAYBOOK_COMMIT" HEAD; then
+            echo "Плейбук в $REPO_DIR уже не старше проверенной версии, оставляем его как есть"
+        else
+            git -C "$REPO_DIR" checkout -q "$PLAYBOOK_COMMIT" \
+                || die "не удалось переключить плейбук на $PLAYBOOK_COMMIT: в $REPO_DIR есть локальные изменения"
+            echo "Плейбук переключён на коммит $PLAYBOOK_COMMIT ($PLAYBOOK_VERSION)"
+        fi
     fi
     cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
-    run_with_retry "just update"
+    # 'just update' сделал бы git pull и ушёл с зафиксированной версии, поэтому только роли
+    run_with_retry "just roles"
 }
 
 # ---------- шаг 5: inventory и vars.yml из шаблона ----------
@@ -311,6 +458,14 @@ render_inventory() {
 
     download "$RAW_BASE/configs/vars.yml" "$WORK_DIR/vars.yml.tpl"
     local out="inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+
+    # Прошлый vars.yml (возможно, с ручными правками) сохраняем рядом
+    if [ -f "$out" ]; then
+        local backup
+        backup="$out.bak-$(date +%Y%m%d-%H%M%S)"
+        cp -p "$out" "$backup"
+        echo "Прошлый vars.yml сохранён: $REPO_DIR/$backup"
+    fi
 
     python3 - "$WORK_DIR/vars.yml.tpl" "$ENV_FILE" "$out" "$NEED_XRAY" <<'PY' || die "не удалось собрать vars.yml"
 import re
@@ -371,15 +526,29 @@ setup_firewall() {
 
 # ---------- шаг 7: установка плейбука и админ ----------
 
+ADMIN_REGISTERED=no
+
 install_playbook() {
     echo "Запускаем установку Matrix. Это займет ~30 минут..."
-    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
+    # Повторы помогают при сетевых сбоях. Ошибки DNS и сертификатов они не лечат,
+    # поэтому попыток мало, а при неудаче выводим, что проверить.
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
+        || die "установка Matrix не удалась (подробности выше). Частые причины:
+  - DNS-записи доменов ($DOMAIN, $DOMAIN_MATRIX, $DOMAIN_WEB_CLIENT, $DOMAIN_ADMIN_PANEL, $DOMAIN_COTURN, $DOMAIN_CALL, $DOMAIN_NTFY) не указывают на $YOUR_IP;
+  - порты 80 и 443 недоступны из интернета, и Let's Encrypt не может выдать сертификаты.
+После исправления повторите: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
+Или запустите этот скрипт снова: значения и секреты возьмутся из $ENV_FILE"
 
     echo "=== Регистрация администратора ==="
     # Пароль передаётся файлом, а не в командной строке (в командной строке он виден в ps)
     local vars_file="$WORK_DIR/admin-vars.json"
     (umask 077 && python3 -c 'import json,sys; print(json.dumps({"username": sys.argv[1], "password": sys.argv[2], "admin": "yes"}))' "$ADMIN_NICK" "$ADMIN_PASS" > "$vars_file")
-    ansible-playbook -i inventory/hosts setup.yml --extra-vars "@$vars_file" --tags=register-user
+    # Ошибка регистрации не должна обесценивать уже выполненную установку
+    if ansible-playbook -i inventory/hosts setup.yml --extra-vars "@$vars_file" --tags=register-user; then
+        ADMIN_REGISTERED=yes
+    else
+        warn "администратор не зарегистрирован (подробности выше)"
+    fi
 }
 
 print_summary() {
@@ -390,17 +559,26 @@ print_summary() {
         printf "Вы отказались от установки XRAY\n\n"
     fi
     printf "Ваш ansible-конфиг доступен по пути:\n%s\n\n" "$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
-    printf "Ваши параметры и секреты (для повторных запусков):\n%s\n\n" "$ENV_FILE"
-    printf "Команда для повторного запуска ansible (если будете менять конфиг):\n%s\n\n" "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+    printf "Ваши параметры и секреты (для повторных запусков, не теряйте):\n%s\n\n" "$ENV_FILE"
+    printf "Команда для повторного запуска ansible (если будете менять vars.yml):\n%s\n\n" \
+        "cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+    printf "Учтите: повторный запуск этого скрипта пересоздаёт vars.yml из шаблона, прошлый файл сохраняется рядом (vars.yml.bak-ДАТА).\n\n"
     printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
     printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
     printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
     printf "Никнейм админа:\n%s\n\n" "$ADMIN_NICK"
     printf "Пароль админа:\n%s\n\n" "$ADMIN_PASS"
+    if [ "$ADMIN_REGISTERED" != yes ]; then
+        warn "администратор не зарегистрирован. Частые причины: такой пользователь уже есть, или MAS счёл пароль слишком простым."
+        printf "Зарегистрировать вручную:\n%s\n\n" \
+            "cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --extra-vars='username=ЛОГИН password=ПАРОЛЬ admin=yes' --tags=register-user"
+    fi
 }
 
 # ---------- главный сценарий ----------
 
+REPO_DIR="$(find_repo_dir)"
+import_existing_vars
 collect_input
 install_base
 setup_swap

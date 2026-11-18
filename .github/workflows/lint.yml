@@ -22,6 +22,17 @@ jobs:
             node --check "$f"
           done
 
+      - name: versions are consistent
+        run: |
+          tag=$(sed -n 's/^RELEASE_TAG="\(.*\)"/\1/p' scripts/matrix_up.sh)
+          pb_script=$(sed -n 's/^PLAYBOOK_VERSION="\(.*\)"/\1/p' scripts/matrix_up.sh)
+          pb_template=$(sed -n 's/^matrix_playbook_migration_validated_version: *//p' configs/vars.yml)
+          echo "release=$tag playbook(script)=$pb_script playbook(template)=$pb_template"
+          [ -n "$tag" ] && [ -n "$pb_script" ]
+          [ "$pb_script" = "$pb_template" ] || { echo "PLAYBOOK_VERSION не совпадает с шаблоном"; exit 1; }
+          grep -q "refs/tags/$tag/scripts/matrix_up.sh" README.md || { echo "README.md ссылается не на $tag"; exit 1; }
+          grep -q "refs/tags/$tag/scripts/matrix_up.sh" README_EN.MD || { echo "README_EN.MD ссылается не на $tag"; exit 1; }
+
       - name: vars.yml template parses as YAML
         run: |
           sudo apt-get install -y -qq python3-yaml

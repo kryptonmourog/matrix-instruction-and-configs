@@ -8,8 +8,12 @@ https://github.com/spantaleev/matrix-docker-ansible-deploy
 
 **Команда для запуска скрипта установки (скопировать и запустить НА СЕРВЕРЕ):**
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.1.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.1.1/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
+
+Скрипт сохраняет ответы и сгенерированные секреты в файл `.env` рядом с собой. Не удаляйте его: при повторном запуске из той же папки скрипт спрашивает только логин и пароль админа, а пароль базы и ключи не меняет. Если на сервере уже есть установка (в том числе сделанная прошлыми версиями скрипта), её домены и секреты переносятся в `.env` автоматически.
+
+Список версий и изменений: [Releases](https://github.com/kryptonmourog/matrix-instruction-and-configs/releases).
 
 Видео-инструкция:
 https://www.youtube.com/watch?v=GGaM5asQGxE
