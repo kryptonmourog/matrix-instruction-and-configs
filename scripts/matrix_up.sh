@@ -9,11 +9,14 @@
 # Шаблон конфига ansible (configs/vars.yml) скачивается из репозитория и заполняется из .env.
 #
 # Запуск: sudo ./matrix_up.sh
+# Обновление установленного сервера до версии плейбука из этого релиза: sudo ./matrix_up.sh --update
 
 set -euo pipefail
 
-RELEASE_TAG="v1.1.2"
-RAW_BASE="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/${RELEASE_TAG}"
+RELEASE_TAG="v1.1.3"
+PROJECT_URL="https://github.com/kryptonmourog/matrix-instruction-and-configs"
+RAW_ROOT="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags"
+RAW_BASE="${RAW_ROOT}/${RELEASE_TAG}"
 PLAYBOOK_REPO="https://github.com/spantaleev/matrix-docker-ansible-deploy.git"
 # У плейбука нет git-тегов, поэтому он фиксируется по коммиту, на котором проверен этот релиз.
 # PLAYBOOK_VERSION должна совпадать с matrix_playbook_migration_validated_version в configs/vars.yml.
@@ -33,8 +36,37 @@ warn() {
     printf "${YELLOW}Внимание: %s${NC}\n" "$*" >&2
 }
 
+usage() {
+    cat <<EOF
+Использование:
+  sudo ./matrix_up.sh            установка или повторная настройка (вопросы, .env, пересоздание vars.yml)
+  sudo ./matrix_up.sh --update   обновление уже установленного сервера до версии плейбука из релиза ${RELEASE_TAG}:
+                                 ничего не спрашивает, vars.yml не пересоздаёт, .env не нужен.
+                                 Сначала сам переходит на последний релиз скрипта ${RELEASE_TAG%%.*}.x, если он вышел
+  --no-self-update               вместе с --update: не обновлять скрипт, остаться на ${RELEASE_TAG}
+EOF
+}
+
+MODE=install
+SELF_UPDATE=yes
+for arg in "$@"; do
+    case "$arg" in
+        --update) MODE=update ;;
+        --no-self-update) SELF_UPDATE=no ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            die "неизвестный параметр: $arg"
+            ;;
+    esac
+done
+[ "$SELF_UPDATE" = yes ] || [ "$MODE" = update ] || die "--no-self-update используется только вместе с --update"
+
 if [ "$(id -u)" -ne 0 ]; then
-    die "запустите скрипт через sudo: sudo ./matrix_up.sh"
+    die "запустите скрипт через sudo: sudo ./matrix_up.sh $*"
 fi
 
 TARGET_USER="${SUDO_USER:-root}"
@@ -48,8 +80,10 @@ ENV_FILE="$SCRIPT_DIR/.env"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-touch "$ENV_FILE" || die "не удалось создать $ENV_FILE. Скачайте скрипт в обычную папку (curl -O ...) и запустите его оттуда"
-chmod 600 "$ENV_FILE"
+if [ "$MODE" = install ]; then
+    touch "$ENV_FILE" || die "не удалось создать $ENV_FILE. Скачайте скрипт в обычную папку (curl -O ...) и запустите его оттуда"
+    chmod 600 "$ENV_FILE"
+fi
 
 # run_with_retry "команда" [число попыток, по умолчанию 15]
 run_with_retry() {
@@ -627,7 +661,121 @@ print_summary() {
     fi
 }
 
+# ---------- режим --update ----------
+
+# Прокси из /etc/environment (его пишет setup_proxy, если стоит Xray). Читаем как данные, без source.
+load_proxy_env() {
+    local line key value
+    [ -f /etc/environment ] || return 0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^(http_proxy|https_proxy|ftp_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|FTP_PROXY|NO_PROXY)=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value#\"}"
+        value="${value%\"}"
+        export "$key=$value"
+    done < /etc/environment
+}
+
+# Поднимает matrix_playbook_migration_validated_version в vars.yml до PLAYBOOK_VERSION.
+# Больше в vars.yml ничего не меняется. Если там уже версия не старше, файл не трогается.
+bump_validated_version() {
+    local file="$1" current
+    current="$(sed -n 's/^matrix_playbook_migration_validated_version:[[:space:]]*//p' "$file" | tr -d "\"' \r" | tail -1)"
+    if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$PLAYBOOK_VERSION" | sort -V | tail -1)" = "$current" ]; then
+        echo "В vars.yml проверенная версия плейбука $current, менять не нужно"
+        return
+    fi
+    cp -p "$file" "$file.bak-$(date +%Y%m%d-%H%M%S)"
+    if [ -n "$current" ]; then
+        sed -i "s/^matrix_playbook_migration_validated_version:.*/matrix_playbook_migration_validated_version: $PLAYBOOK_VERSION/" "$file"
+    else
+        printf '\nmatrix_playbook_migration_validated_version: %s\n' "$PLAYBOOK_VERSION" >> "$file"
+    fi
+    echo "В vars.yml проверенная версия плейбука: ${current:-не задана} -> $PLAYBOOK_VERSION (прошлый файл сохранён рядом как vars.yml.bak-ДАТА)"
+}
+
+# Переход на последний релиз скрипта той же мажорной версии (только в режиме --update).
+# Любая неудача не мешает обновлению: продолжаем с текущей версией скрипта.
+self_update() {
+    [ "$SELF_UPDATE" = yes ] || return 0
+    echo "Проверяем, нет ли новой версии скрипта..."
+    local latest
+    latest="$(git ls-remote --tags --refs "$PROJECT_URL.git" 2> /dev/null \
+        | sed -n 's#.*refs/tags/\(v[0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -1 || true)"
+    if [ -z "$latest" ]; then
+        warn "не удалось узнать последнюю версию скрипта, продолжаем с $RELEASE_TAG"
+        return 0
+    fi
+    if [ "$(printf '%s\n%s\n' "$latest" "$RELEASE_TAG" | sort -V | tail -1)" = "$RELEASE_TAG" ]; then
+        echo "Скрипт актуален ($RELEASE_TAG)"
+        return 0
+    fi
+    if [ "${latest%%.*}" != "${RELEASE_TAG%%.*}" ]; then
+        warn "вышла версия скрипта $latest с несовместимыми изменениями, автоматически на неё не переходим. Прочитайте описание: $PROJECT_URL/releases. Продолжаем с $RELEASE_TAG"
+        return 0
+    fi
+
+    local self new
+    self="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+    new="$WORK_DIR/matrix_up.sh.new"
+    if ! curl -fsSL "$RAW_ROOT/$latest/scripts/matrix_up.sh" -o "$new"; then
+        warn "не удалось скачать скрипт $latest, продолжаем с $RELEASE_TAG"
+        return 0
+    fi
+    # Запускаем только скрипт, который заявляет нужную версию и умеет --update без вопросов
+    if ! bash -n "$new" || ! grep -qx "RELEASE_TAG=\"$latest\"" "$new" || ! grep -q -- '--no-self-update) SELF_UPDATE=no' "$new"; then
+        warn "скачанный скрипт $latest не прошёл проверку, продолжаем с $RELEASE_TAG"
+        return 0
+    fi
+    # Новый файл кладём рядом и переименовываем: работающий bash продолжает читать старый файл
+    if ! { cp "$new" "$self.new" && chmod 755 "$self.new" && chown --reference="$self" "$self.new" && mv -f "$self.new" "$self"; } 2> /dev/null; then
+        rm -f "$self.new"
+        warn "не удалось заменить $self (скачайте скрипт $latest вручную), продолжаем с $RELEASE_TAG"
+        return 0
+    fi
+    echo "Скрипт обновлён: $RELEASE_TAG -> $latest ($self). Запускаем новую версию..."
+    rm -rf "$WORK_DIR"
+    exec bash "$self" --update --no-self-update
+}
+
+run_update() {
+    load_proxy_env
+    self_update
+    echo "=== Обновление Matrix до версии плейбука из релиза $RELEASE_TAG ($PLAYBOOK_VERSION) ==="
+    REPO_DIR="$(find_repo_dir)"
+    local configs=()
+    local f
+    for f in "$REPO_DIR"/inventory/host_vars/*/vars.yml; do
+        [ -f "$f" ] && configs+=("$f")
+    done
+    [ "${#configs[@]}" -gt 0 ] || die "установка не найдена (нет $REPO_DIR/inventory/host_vars/*/vars.yml). Для новой установки запустите скрипт без --update"
+    [ "${#configs[@]}" -eq 1 ] || die "в $REPO_DIR/inventory/host_vars несколько конфигов, обновляйте вручную: ${configs[*]}"
+    [ -d "$REPO_DIR/.git" ] || die "$REPO_DIR не git-репозиторий, обновить плейбук скриптом нельзя"
+    local cmd
+    for cmd in ansible-playbook just docker git; do
+        command -v "$cmd" > /dev/null || die "не найдена команда $cmd. Запустите скрипт без --update, он доустановит недостающее"
+    done
+
+    clone_playbook
+    bump_validated_version "${configs[0]}"
+
+    echo "Запускаем обновление Matrix. Это может занять ~30 минут..."
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
+        || die "обновление не удалось (подробности выше). Прошлый vars.yml сохранён рядом с ${configs[0]} как vars.yml.bak-ДАТА.
+Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
+
+    printf "\n\nОбновление завершено!\n\n"
+    printf "Плейбук: %s (коммит %s)\n" "$REPO_DIR" "$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    printf "Конфиг: %s\n\n" "${configs[0]}"
+}
+
 # ---------- главный сценарий ----------
+
+if [ "$MODE" = update ]; then
+    run_update
+    exit 0
+fi
 
 REPO_DIR="$(find_repo_dir)"
 import_existing_vars
