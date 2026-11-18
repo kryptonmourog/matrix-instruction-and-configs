@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-RELEASE_TAG="v1.1.1"
+RELEASE_TAG="v1.1.2"
 RAW_BASE="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/${RELEASE_TAG}"
 PLAYBOOK_REPO="https://github.com/spantaleev/matrix-docker-ansible-deploy.git"
 # У плейбука нет git-тегов, поэтому он фиксируется по коммиту, на котором проверен этот релиз.
@@ -76,6 +76,18 @@ run_with_retry() {
 
 download() {
     curl -fsSL "$1" -o "$2" || die "не удалось скачать $1"
+}
+
+# wait_for_port хост порт секунд: ждёт, пока порт начнёт принимать соединения
+wait_for_port() {
+    local i
+    for ((i = 0; i < $3; i++)); do
+        if (exec 3<> "/dev/tcp/$1/$2") 2> /dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 # ---------- работа с .env (без source: файл читается как данные) ----------
@@ -365,7 +377,23 @@ setup_xray() {
     install -m 644 "$WORK_DIR/config.json" /usr/local/etc/xray/config.json
     systemctl enable xray
     systemctl restart xray
-    echo "Xray установлен и запущен"
+
+    # restart возвращается раньше, чем Xray откроет порты. Дальше всё качается через прокси,
+    # поэтому ждём порты здесь, иначе загрузки падают с "connection refused".
+    echo "Ждём, пока Xray откроет порты 10808 и ${PROXY_PORT}..."
+    if ! wait_for_port 127.0.0.1 "$PROXY_PORT" 30 || ! wait_for_port 127.0.0.1 10808 5; then
+        systemctl status xray --no-pager -l || true
+        journalctl -u xray -n 30 --no-pager || true
+        die "Xray не открыл порты за 30 секунд (журнал выше)"
+    fi
+
+    # Проверяем, что через прокси реально есть выход. Неудача не фатальна: VLESS-сервер мог
+    # прилечь на минуту, а загрузки дальше сами делают повторы.
+    if run_with_retry "curl -fsS -o /dev/null --max-time 15 -x http://127.0.0.1:${PROXY_PORT} https://github.com" 3; then
+        echo "Xray установлен и работает"
+    else
+        warn "Xray запущен, но через него не открывается https://github.com. Проверьте ссылку vless:// и доступность вашего VLESS-сервера. Установка продолжится, но загрузки могут падать."
+    fi
 }
 
 setup_proxy() {
@@ -510,10 +538,34 @@ PY
 
 # ---------- шаг 6: firewall ----------
 
+# Порты SSH: из конфига sshd, из ssh.socket (Ubuntu 22.10+), из прослушиваемых sshd
+# сокетов и из текущего подключения. Если ничего не нашли, считаем, что это 22.
+detect_ssh_ports() {
+    {
+        if command -v sshd > /dev/null 2>&1; then
+            # При запуске через ssh.socket каталога /run/sshd может не быть, и sshd -T падает
+            mkdir -p /run/sshd 2> /dev/null || true
+            sshd -T 2> /dev/null | awk '$1 == "port" {print $2}'
+        fi
+        systemctl show ssh.socket -p Listen --value 2> /dev/null \
+            | grep -oE ':[0-9]+ ' | tr -d ': '
+        ss -Htlnp 2> /dev/null | awk '/"sshd/ {sub(/.*:/, "", $4); print $4}'
+        if [ -n "${SSH_CONNECTION:-}" ]; then
+            awk '{print $4}' <<< "$SSH_CONNECTION"
+        fi
+    } | grep -xE '[0-9]{1,5}' | awk '$1 >= 1 && $1 <= 65535' | sort -un
+}
+
 setup_firewall() {
     echo "=== Firewall ==="
-    local rule
-    for rule in 22/tcp 80/tcp 443/tcp 3478/tcp 3478/udp 5349/tcp 5349/udp \
+    local rule ssh_ports port
+    ssh_ports="$(detect_ssh_ports || true)"
+    [ -n "$ssh_ports" ] || ssh_ports=22
+    for port in $ssh_ports; do
+        echo "Открываем SSH-порт $port"
+        ufw allow "$port/tcp"
+    done
+    for rule in 80/tcp 443/tcp 3478/tcp 3478/udp 5349/tcp 5349/udp \
                 7880/tcp 7881/tcp 7882/udp 8448/tcp 49152:49652/udp; do
         ufw allow "$rule"
     done
