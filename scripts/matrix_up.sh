@@ -1,19 +1,19 @@
 #!/bin/bash
-# Установка Matrix (matrix-docker-ansible-deploy) и, по желанию, Xray-прокси.
+# Установка и обслуживание Matrix (matrix-docker-ansible-deploy) и, по желанию, Xray-прокси.
 #
-# Значения берутся из файла .env рядом со скриптом. Недостающие значения спрашиваются
-# и сохраняются в .env. Секреты генерируются один раз и тоже сохраняются, поэтому
-# повторный запуск не меняет пароль БД и ключи уже установленного сервера.
-# Если на сервере уже есть установка (в том числе сделанная версией v1.0.0),
-# значения и секреты берутся из её vars.yml.
-# Шаблон конфига ansible (configs/vars.yml) скачивается из репозитория и заполняется из .env.
+# Первый запуск: скачать и выполнить sudo ./matrix_up.sh. Скрипт копирует себя в систему,
+# дальше он доступен как команда matrix-up (или matrix_up) и открывает панель управления.
 #
-# Запуск: sudo ./matrix_up.sh
-# Обновление установленного сервера до версии плейбука из этого релиза: sudo ./matrix_up.sh --update
+# Параметры хранятся в /etc/matrix_up/matrix.env. Недостающие значения спрашиваются и сохраняются
+# туда же. Секреты генерируются один раз, поэтому повторная установка не меняет пароль БД и ключи.
+# Если на сервере уже есть установка (в том числе сделанная версией v1.0.0), значения и секреты
+# берутся из её vars.yml. Шаблон configs/vars.yml скачивается из репозитория и заполняется параметрами.
+#
+# Запуск: sudo matrix-up [--install | --update] [--plain]   (подробно: matrix-up --help)
 
 set -euo pipefail
 
-RELEASE_TAG="v1.1.3"
+RELEASE_TAG="v1.2.0"
 PROJECT_URL="https://github.com/kryptonmourog/matrix-instruction-and-configs"
 RAW_ROOT="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags"
 RAW_BASE="${RAW_ROOT}/${RELEASE_TAG}"
@@ -26,33 +26,386 @@ PROXY_PORT=10809
 DOCKER_BRIDGE_IP="172.17.0.1"
 
 RED='\e[31m'
+GREEN='\e[32m'
 YELLOW='\e[33m'
+GRAY='\e[90m'
 NC='\e[0m'
+
+# Исходные stdout и stderr. В режиме gum вывод шагов уходит в журнал, а сообщения - сюда.
+exec 8>&1 9>&2
+
+# ---------- интерфейс: gum в терминале, обычный текст без него ----------
+
+UI=plain          # gum | plain
+UI_REQUEST=auto   # plain - если передан --plain
+GUM=""
+GUM_VERSION="2.0.2"
+GUM_SHA256_X86_64="d842e06d93dbed90af48cb8dd10698db6f22e331fc40346bb37bbc753109edc2"
+GUM_SHA256_ARM64="8ebf8b54ec1e8c81f2bb58b59ff9b70998186a4d11375f0cf357b80e0ccfa1d5"
+# Системная установка скрипта: команды matrix-up и matrix_up ведут на копию в INSTALL_DIR
+INSTALL_DIR="/usr/local/lib/matrix_up"
+INSTALLED_SCRIPT="$INSTALL_DIR/matrix_up.sh"
+COMMAND_NAMES=(matrix-up matrix_up)
+BIN_DIR="/usr/local/bin"
+# Параметры и секреты установки (раньше лежали в .env рядом со скриптом)
+CONFIG_DIR="/etc/matrix_up"
+# Не в PATH, чтобы не мешать gum, который мог быть установлен отдельно
+GUM_DIR="$INSTALL_DIR/gum-${GUM_VERSION}"
+LOG_FILE="/var/log/matrix_up.log"
+WORK_DIR=""
+STEP_NO=0
+STEP_TOTAL=0
+STEP_TITLE=""
+STEP_HINT=""
+STEP_NOTES=()
+STEP_WARNINGS=()
+SPIN_PID=""
+DIE_MSG=""
+INTERRUPT_MSG=""
+BACK=2  # код возврата "вернуться к предыдущему вопросу"
+SKIP=3  # код возврата "вопрос сейчас не нужен"
+
 die() {
-    printf "${RED}Ошибка: %s${NC}\n" "$*" >&2
+    # До установки ловушки EXIT и в подоболочке $(...) сообщение печатается сразу
+    if [ -z "$WORK_DIR" ] || [ "$BASH_SUBSHELL" -gt 0 ]; then
+        printf "${RED}Ошибка: %s${NC}\n" "$*" >&9
+        exit 1
+    fi
+    DIE_MSG="$*"
     exit 1
 }
+
+# Предупреждение. Во время шага в режиме gum показывается под строкой шага.
 warn() {
-    printf "${YELLOW}Внимание: %s${NC}\n" "$*" >&2
+    if [ "$UI" = gum ] && [ -n "$STEP_TITLE" ]; then
+        printf 'Внимание: %s\n' "$*"
+        STEP_WARNINGS+=("$*")
+    else
+        printf "${YELLOW}Внимание: %s${NC}\n" "$*" >&9
+    fi
+}
+
+# Пояснение для пользователя. Во время шага в режиме gum показывается под строкой шага.
+note() {
+    if [ "$UI" != gum ]; then
+        printf '%s\n' "$*"
+    elif [ -n "$STEP_TITLE" ]; then
+        printf '%s\n' "$*"
+        STEP_NOTES+=("$*")
+    else
+        printf "  ${GRAY}%s${NC}\n" "$*" >&9
+    fi
+}
+
+stop_spinner() {
+    [ -n "$SPIN_PID" ] || return 0
+    local i sig
+    # Спиннер ждёт команду-заглушку; завершаем её, и gum сам убирает строку.
+    # Если gum не успел её запустить, он не завершится сам, а SIGTERM может игнорировать.
+    for sig in "" TERM KILL; do
+        [ -z "$sig" ] || kill -s "$sig" "$SPIN_PID" 2> /dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            pkill -P "$SPIN_PID" 2> /dev/null || true
+            kill -0 "$SPIN_PID" 2> /dev/null || break 2
+            sleep 0.1
+        done
+    done
+    wait "$SPIN_PID" 2> /dev/null || true
+    SPIN_PID=""
+    # Курсор и режим вставки, если gum был остановлен принудительно
+    printf '\r\033[K\033[?25h\033[?2004l' >&9
+}
+
+on_exit() {
+    local rc=$?
+    stop_spinner
+    if [ "$rc" -ne 0 ]; then
+        if [ "$UI" = gum ] && [ -n "$STEP_TITLE" ] && [ "$rc" -eq 130 ]; then
+            printf "  ${YELLOW}■${NC} %s\n" "$STEP_TITLE" >&9
+        elif [ "$UI" = gum ] && [ -n "$STEP_TITLE" ]; then
+            printf "  ${RED}✗${NC} %s\n\n" "$STEP_TITLE" >&9
+            printf "${GRAY}Последние строки журнала %s:${NC}\n" "$LOG_FILE" >&9
+            tail -n 25 "$LOG_FILE" 2> /dev/null | sed 's/^/  │ /' >&9 || true
+            printf '\n' >&9
+        fi
+        if [ -n "$INTERRUPT_MSG" ]; then
+            printf '%b%s%b\n' "$YELLOW" "$INTERRUPT_MSG" "$NC" >&9
+        elif [ -n "$DIE_MSG" ]; then
+            printf "${RED}Ошибка: %s${NC}\n" "$DIE_MSG" >&9
+        elif [ -n "$STEP_TITLE" ]; then
+            printf "${RED}Ошибка: шаг «%s» завершился с ошибкой (код %s)${NC}\n" "$STEP_TITLE" "$rc" >&9
+        fi
+        if [ "$UI" = gum ] && [ -n "$STEP_TITLE" ]; then
+            printf 'Полный журнал: %s\n' "$LOG_FILE" >&9
+        fi
+    fi
+    [ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"
+}
+
+# Ctrl+C в вопросах: спокойное сообщение вместо ошибки (работает и внутри $(...))
+cancel_input() {
+    if [ -n "${ENV_FILE:-}" ] && [ -s "$ENV_FILE" ]; then
+        printf "\n${YELLOW}Отменено. Введённые ответы сохранены в %s, при следующем запуске их можно принять или исправить.${NC}\n" "$ENV_FILE" >&9
+    else
+        printf '\n%bОтменено.%b\n' "$YELLOW" "$NC" >&9
+    fi
+    exit 130
+}
+
+# gum после Esc печатает "not submitted" / "nothing selected" - стираем эту строку
+clear_gum_line() {
+    printf '\033[1A\r\033[2K' >&9
+}
+
+# Ctrl+C или закрытие терминала. Без этого Ctrl+C во время шага прерывал только текущую
+# команду, а повторы run_with_retry молча запускали её снова.
+on_interrupt() {
+    trap - INT TERM HUP
+    if [ -n "$STEP_TITLE" ]; then
+        INTERRUPT_MSG="Прервано на шаге «$STEP_TITLE». Запустите скрипт снова, чтобы продолжить: введённые параметры сохранены."
+        exit 130
+    fi
+    cancel_input
+}
+
+# Очистка экрана (для панели и переходов из неё)
+ui_clear() {
+    [ -t 1 ] || return 0
+    printf '\033[H\033[2J' >&9
+}
+
+fmt_duration() {
+    local s="$1"
+    if [ "$s" -lt 60 ]; then
+        printf '%d с' "$s"
+    else
+        printf '%d мин %d с' $((s / 60)) $((s % 60))
+    fi
+}
+
+# gum включается, только если ввод и вывод - терминал. Бинарник фиксированной версии
+# скачивается один раз, сверяется по SHA-256 и хранится в $GUM_DIR для следующих запусков.
+ui_init() {
+    [ "$UI_REQUEST" != plain ] || return 0
+    [ -t 0 ] && [ -t 1 ] && [ -t 2 ] || return 0
+    [ "${TERM:-dumb}" != dumb ] || return 0
+    local arch sum
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 sum="$GUM_SHA256_X86_64" ;;
+        aarch64 | arm64) arch=arm64 sum="$GUM_SHA256_ARM64" ;;
+        *) return 0 ;;
+    esac
+    local name="gum_${GUM_VERSION}_Linux_${arch}"
+    # Журнал нужен, чтобы убрать вывод шагов с экрана. Без журнала остаёмся в текстовом режиме.
+    if ! (umask 077 && touch "$LOG_FILE") 2> /dev/null; then
+        LOG_FILE="$SCRIPT_DIR/matrix_up.log"
+        if ! (umask 077 && touch "$LOG_FILE") 2> /dev/null; then
+            warn "не удалось создать журнал установки, продолжаем в текстовом режиме"
+            return 0
+        fi
+    fi
+    chmod 600 "$LOG_FILE" 2> /dev/null || true
+    if "$GUM_DIR/gum" --version 2> /dev/null | grep -q "v$GUM_VERSION"; then
+        GUM="$GUM_DIR/gum"
+    else
+        printf 'Загружаем интерфейс (gum %s)...' "$GUM_VERSION" >&9
+        if curl -fsSL --max-time 60 "https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/${name}.tar.gz" \
+            -o "$WORK_DIR/gum.tar.gz" 2> /dev/null \
+            && echo "$sum  $WORK_DIR/gum.tar.gz" | sha256sum -c --status \
+            && tar --no-same-owner -xzf "$WORK_DIR/gum.tar.gz" -C "$WORK_DIR" "$name/gum" 2> /dev/null \
+            && "$WORK_DIR/$name/gum" --version > /dev/null 2>&1; then
+            # Сохраняем для следующих запусков; не вышло - работаем из временной папки
+            if install -D -m 755 "$WORK_DIR/$name/gum" "$GUM_DIR/gum" 2> /dev/null; then
+                GUM="$GUM_DIR/gum"
+            else
+                GUM="$WORK_DIR/$name/gum"
+            fi
+        fi
+        printf '\r\033[K' >&9
+    fi
+    if [ -z "$GUM" ]; then
+        warn "не удалось загрузить gum, продолжаем в текстовом режиме"
+        return 0
+    fi
+    UI=gum
+    printf '\n===== %s matrix_up.sh %s =====\n' "$(date '+%F %T')" "$RELEASE_TAG" >> "$LOG_FILE"
+}
+
+ui_banner() {
+    if [ "$UI" = gum ]; then
+        # Отступы - обычными переводами строки: --margin у gum рисует строки из пробелов
+        printf '\n' >&9
+        "$GUM" style --border rounded --border-foreground 212 --padding "0 2" \
+            -- "$("$GUM" style --bold --foreground 212 -- "$1")" "$("$GUM" style --faint -- "$2")" >&9
+        printf '\n' >&9
+    else
+        printf '\n=== %s ===\n%s\n' "$1" "$2"
+    fi
+}
+
+ui_section() {
+    if [ "$UI" = gum ]; then
+        printf '\n' >&9
+        "$GUM" style --bold --foreground 212 -- "$1" >&9
+    else
+        printf '\n=== %s ===\n' "$1"
+    fi
+}
+
+# ui_table подпись значение [подпись значение ...] - две колонки в рамке
+ui_table() {
+    local labels=() values=() i
+    while [ "$#" -ge 2 ]; do
+        labels+=("$1")
+        values+=("$2")
+        shift 2
+    done
+    if [ "$UI" = gum ]; then
+        local c1 c2
+        c1="$("$GUM" style --foreground 245 -- "${labels[@]}")"
+        c2="$("$GUM" style --margin "0 0 0 2" -- "${values[@]}")"
+        "$GUM" join --horizontal "$c1" "$c2" | "$GUM" style --border rounded --border-foreground 240 --padding "0 1" >&9
+    else
+        for i in "${!labels[@]}"; do
+            printf '  %s: %s\n' "${labels[$i]}" "${values[$i]}"
+        done
+    fi
+}
+
+# Строка "принято" после ответа (в текстовом режиме ответ и так виден)
+ui_answer() {
+    [ "$UI" = gum ] || return 0
+    printf "  ${GREEN}✓${NC} ${GRAY}%s:${NC} %s\n" "$1" "$2" >&9
+}
+
+ui_invalid() {
+    if [ "$UI" = gum ]; then
+        printf "  ${RED}✗ %s${NC}\n" "$1" >&9
+    else
+        printf '  %s\n' "$1" >&9
+    fi
+}
+
+# prompt_value "вопрос" "по умолчанию" [secret] - печатает ответ.
+# Вызывается только как $(prompt_value ...): код 2 - "назад", остальные ненулевые - ошибка (уже выведена).
+prompt_value() {
+    local prompt="$1" default="${2:-}" secret="${3:-}" value="" rc=0
+    if [ "$UI" = gum ]; then
+        local args=(input --header "$prompt" --prompt "› " --width 0 --char-limit 0)
+        if [ -n "$secret" ]; then
+            args+=(--password --placeholder "Enter — сгенерировать")
+        else
+            args+=(--value "$default")
+        fi
+        value="$("$GUM" "${args[@]}")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1)
+                clear_gum_line
+                exit "$BACK"
+                ;; # Esc
+            *) cancel_input ;;
+        esac
+    else
+        local shown="$prompt"
+        [ -z "$default" ] || shown+=" [$default]"
+        if [ -n "$secret" ]; then
+            read -rs -p "$shown: " value || die "ввод закончился, а ответы ещё нужны"
+            echo >&9
+        else
+            read -r -p "$shown: " value || die "ввод закончился, а ответы ещё нужны"
+        fi
+        [ "$value" != "<" ] || exit "$BACK"
+        [ -n "$value" ] || value="$default"
+    fi
+    printf '%s' "$value"
+}
+
+# ui_yes_no "вопрос" yes|no -> 0 да, 1 нет, 2 назад
+ui_yes_no() {
+    local question="$1" def="$2" answer rc=0
+    if [ "$UI" = gum ]; then
+        local yes="Да" no="Нет" back="← Назад" selected
+        if [ "$def" = yes ]; then selected="$yes"; else selected="$no"; fi
+        answer="$("$GUM" choose --header "$question" --selected "$selected" -- "$yes" "$no" "$back")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1)
+                clear_gum_line
+                return "$BACK"
+                ;;
+            *) cancel_input ;;
+        esac
+        [ "$answer" != "$back" ] || return "$BACK"
+        if [ "$answer" = "$yes" ]; then return 0; fi
+        return 1
+    fi
+    local hint="y/N"
+    [ "$def" != yes ] || hint="Y/n"
+    read -r -p "$question [$hint, < — назад]: " answer || die "ввод закончился, а ответы ещё нужны"
+    [ "$answer" != "<" ] || return "$BACK"
+    if [ -z "$answer" ]; then
+        [ "$def" = yes ] && return 0
+        return 1
+    fi
+    if [[ "$answer" =~ ^[YyДд] ]]; then return 0; fi
+    return 1
+}
+
+# run_step "Название" функция [аргументы]
+# Функция выполняется в этом же процессе (её переменные, cd и export сохраняются).
+# В режиме gum её вывод уходит в журнал, а на экране крутится спиннер.
+run_step() {
+    local title="$1"
+    shift
+    STEP_NO=$((STEP_NO + 1))
+    STEP_TITLE="[$STEP_NO/$STEP_TOTAL] $title"
+    STEP_NOTES=()
+    STEP_WARNINGS=()
+    if [ "$UI" != gum ]; then
+        printf '\n=== %s ===\n' "$STEP_TITLE"
+        "$@"
+        STEP_TITLE=""
+        return 0
+    fi
+    printf '\n===== %s =====\n' "$STEP_TITLE" >> "$LOG_FILE"
+    local start="$SECONDS" line
+    "$GUM" spin --spinner dot --title "$STEP_TITLE${STEP_HINT:+  ($STEP_HINT)}" -- tail --pid="$$" -f /dev/null < /dev/null >&9 2>&9 &
+    SPIN_PID=$!
+    "$@" >> "$LOG_FILE" 2>&1
+    stop_spinner
+    printf "  ${GREEN}✓${NC} %s ${GRAY}%s${NC}\n" "$STEP_TITLE" "$(fmt_duration $((SECONDS - start)))" >&9
+    for line in "${STEP_NOTES[@]}"; do
+        printf "      ${GRAY}%s${NC}\n" "$line" >&9
+    done
+    for line in "${STEP_WARNINGS[@]}"; do
+        printf "      ${YELLOW}! %s${NC}\n" "$line" >&9
+    done
+    STEP_TITLE=""
 }
 
 usage() {
     cat <<EOF
-Использование:
-  sudo ./matrix_up.sh            установка или повторная настройка (вопросы, .env, пересоздание vars.yml)
-  sudo ./matrix_up.sh --update   обновление уже установленного сервера до версии плейбука из релиза ${RELEASE_TAG}:
-                                 ничего не спрашивает, vars.yml не пересоздаёт, .env не нужен.
+Использование (после первого запуска скрипт доступен как команда matrix-up или matrix_up):
+  sudo matrix-up                 панель управления, если Matrix уже установлен; иначе установка
+  sudo matrix-up --install       установка или переустановка: вопросы, параметры в $CONFIG_DIR/matrix.env,
+                                 пересоздание vars.yml
+  sudo matrix-up --update        обновление установленного сервера до версии плейбука из релиза ${RELEASE_TAG}:
+                                 ничего не спрашивает, vars.yml не пересоздаёт.
                                  Сначала сам переходит на последний релиз скрипта ${RELEASE_TAG%%.*}.x, если он вышел
   --no-self-update               вместе с --update: не обновлять скрипт, остаться на ${RELEASE_TAG}
+  --plain                        обычный текстовый вывод без интерфейса gum
 EOF
 }
 
-MODE=install
+MODE=auto
 SELF_UPDATE=yes
 for arg in "$@"; do
     case "$arg" in
+        --install) MODE=install ;;
         --update) MODE=update ;;
         --no-self-update) SELF_UPDATE=no ;;
+        --plain) UI_REQUEST=plain ;;
         -h | --help)
             usage
             exit 0
@@ -65,25 +418,28 @@ for arg in "$@"; do
 done
 [ "$SELF_UPDATE" = yes ] || [ "$MODE" = update ] || die "--no-self-update используется только вместе с --update"
 
+# Настоящий путь к скрипту (команда matrix-up - это ссылка на него)
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
 if [ "$(id -u)" -ne 0 ]; then
-    die "запустите скрипт через sudo: sudo ./matrix_up.sh $*"
+    if [ -f "$SCRIPT_PATH" ] && command -v sudo > /dev/null 2>&1; then
+        exec sudo bash "$SCRIPT_PATH" "$@"
+    fi
+    die "запустите скрипт через sudo: sudo $0 $*"
 fi
 
 TARGET_USER="${SUDO_USER:-root}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [ -n "$TARGET_HOME" ] || die "не удалось определить домашний каталог пользователя $TARGET_USER"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$SCRIPT_DIR/.env"
+ENV_FILE="$CONFIG_DIR/matrix.env"
+OLD_ENV_FILE="$SCRIPT_DIR/.env"
 
 # Рабочая папка для скачанных файлов. Удаляется при любом выходе.
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-if [ "$MODE" = install ]; then
-    touch "$ENV_FILE" || die "не удалось создать $ENV_FILE. Скачайте скрипт в обычную папку (curl -O ...) и запустите его оттуда"
-    chmod 600 "$ENV_FILE"
-fi
+trap on_exit EXIT
+trap on_interrupt INT TERM HUP
 
 # run_with_retry "команда" [число попыток, по умолчанию 15]
 run_with_retry() {
@@ -137,27 +493,6 @@ env_set() {
     printf '%s="%s"\n' "$key" "$value" >> "$tmp"
     cat "$tmp" > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-}
-
-# ask ПЕРЕМЕННАЯ "подсказка" функция_проверки [функция_нормализации]
-# Берёт значение из .env, если оно там есть; иначе спрашивает и сохраняет.
-ask() {
-    local var="$1" prompt="$2" check="$3" normalize="${4:-}" value
-    value="$(env_get "$var")"
-    if [ -z "$value" ]; then
-        while true; do
-            read -r -p "$prompt: " value
-            if [ -n "$normalize" ]; then
-                value="$("$normalize" "$value")"
-            fi
-            if "$check" "$value"; then
-                break
-            fi
-            echo "  Некорректное значение, попробуйте ещё раз."
-        done
-        env_set "$var" "$value"
-    fi
-    printf -v "$var" '%s' "$value"
 }
 
 # Секрет: генерируется один раз и сохраняется в .env
@@ -244,8 +579,9 @@ import_existing_vars() {
     existing="${files[0]}"
     command -v python3 > /dev/null 2>&1 || die "найдена прошлая установка ($existing), но для переноса её настроек нужен python3"
 
-    echo "=== Найдена прошлая установка: $existing ==="
-    echo "Её домены и секреты переносятся в $ENV_FILE, пароль БД и ключи не изменятся."
+    ui_section "Найдена прошлая установка"
+    note "$existing"
+    note "Её домены и секреты переносятся в $ENV_FILE, пароль БД и ключи не изменятся."
     local imported="$WORK_DIR/imported.tsv"
     python3 - "$existing" > "$imported" <<'PY' || die "не удалось прочитать $existing"
 import re
@@ -265,7 +601,10 @@ mapping = {
     "postgres_connection_password": "DB_PASSWORD",
     "coturn_turn_static_auth_secret": "COTURN_SECRET",
     "matrix_authentication_service_config_secrets_encryption": "MAS_ENC_KEY",
+    "matrix_ketesa_enabled": "KETESA_ENABLED",
+    "matrix_element_admin_enabled": "ELEMENT_ADMIN_ENABLED",
 }
+toggles = {"KETESA_ENABLED", "ELEMENT_ADMIN_ENABLED"}
 line_re = re.compile(r"""^([A-Za-z_][A-Za-z0-9_]*):\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
 found = {}
 uses_proxy = False
@@ -279,6 +618,8 @@ with open(sys.argv[1], encoding="utf-8") as f:
         if key == "your_proxy_http_proxy" and value:
             uses_proxy = True
         if key in mapping and value and "{{" not in value and "$" not in value and '"' not in value:
+            if mapping[key] in toggles:
+                value = "true" if value.lower() in ("true", "yes", "on") else "false"
             found[mapping[key]] = value
 found["NEED_XRAY"] = "yes" if uses_proxy else "no"
 for key, value in found.items():
@@ -303,65 +644,383 @@ require_secrets_in_env() {
     done
 }
 
-# ---------- шаг 1: все вопросы сразу, дальше установка идёт без участия ----------
+# ---------- вопросы: по одному, с возвратом назад и экраном проверки ----------
+
+# Порядок вопросов. VLESS_LINK задаётся только при Xray; логин и пароль админа в .env не пишутся.
+QUESTIONS=(YOUR_IP DOMAIN DOMAIN_MATRIX DOMAIN_WEB_CLIENT KETESA_ENABLED ELEMENT_ADMIN_ENABLED DOMAIN_ADMIN_PANEL
+    DOMAIN_COTURN DOMAIN_CALL DOMAIN_NTFY
+    ADMIN_EMAIL NEED_XRAY VLESS_LINK ADMIN_NICK ADMIN_PASS)
+SUBDOMAINS=(DOMAIN_MATRIX DOMAIN_WEB_CLIENT DOMAIN_ADMIN_PANEL DOMAIN_COTURN DOMAIN_CALL DOMAIN_NTFY)
+# Поля, уже показанные в этом запуске: при возврате назад и движении вперёд они спрашиваются снова
+declare -A ASKED_FIELDS=()
+ADMIN_NICK=""
+ADMIN_PASS=""
+ADMIN_PASS_GENERATED=no
+NEED_XRAY=""
+VLESS_LINK=""
+KETESA_ENABLED=""
+ELEMENT_ADMIN_ENABLED=""
+DOMAIN_ADMIN_PANEL=""
+
+field_label() {
+    case "$1" in
+        YOUR_IP) echo "IP сервера" ;;
+        DOMAIN) echo "Основной домен" ;;
+        DOMAIN_MATRIX) echo "Matrix" ;;
+        DOMAIN_WEB_CLIENT) echo "Element Web" ;;
+        DOMAIN_ADMIN_PANEL) echo "Поддомен Element Admin" ;;
+        DOMAIN_COTURN) echo "Coturn" ;;
+        DOMAIN_CALL) echo "Element Call" ;;
+        DOMAIN_NTFY) echo "ntfy" ;;
+        ADMIN_EMAIL) echo "Email (Let's Encrypt)" ;;
+        NEED_XRAY) echo "Xray-прокси" ;;
+        KETESA_ENABLED) echo "Админка Ketesa" ;;
+        ELEMENT_ADMIN_ENABLED) echo "Админка Element Admin" ;;
+        VLESS_LINK) echo "Ссылка vless://" ;;
+        ADMIN_NICK) echo "Логин админа" ;;
+        ADMIN_PASS) echo "Пароль админа" ;;
+    esac
+}
+
+field_value() {
+    case "$1" in
+        NEED_XRAY) if [ "$NEED_XRAY" = yes ]; then echo "да"; else echo "нет"; fi ;;
+        KETESA_ENABLED | ELEMENT_ADMIN_ENABLED) if [ "${!1}" = true ]; then echo "да"; else echo "нет"; fi ;;
+        VLESS_LINK) if [ "${#VLESS_LINK}" -gt 40 ]; then echo "${VLESS_LINK:0:40}…"; else echo "$VLESS_LINK"; fi ;;
+        ADMIN_PASS) if [ "$ADMIN_PASS_GENERATED" = yes ]; then echo "будет сгенерирован"; else echo "задан"; fi ;;
+        *) echo "${!1}" ;;
+    esac
+}
+
+# IP, с которого сервер выходит в интернет. Только подсказка: за NAT это будет внутренний адрес.
+detect_ip() {
+    ip -4 route get 1.1.1.1 2> /dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1
+}
+
+# ask ПЕРЕМЕННАЯ "вопрос" проверка [нормализация] [по умолчанию] -> 0 / 2 (назад)
+# Значение из .env не спрашивается, если поле ещё не показывалось в этом запуске.
+ask() {
+    local var="$1" prompt="$2" check="$3" normalize="${4:-}" default="${5:-}" value rc
+    value="$(env_get "$var")"
+    if [ -n "$value" ] && [ -z "${ASKED_FIELDS[$var]:-}" ]; then
+        printf -v "$var" '%s' "$value"
+        return 0
+    fi
+    [ -z "$value" ] || default="$value"
+    ASKED_FIELDS[$var]=1
+    while true; do
+        rc=0
+        value="$(prompt_value "$prompt" "$default")" || rc=$?
+        [ "$rc" -ne "$BACK" ] || return "$BACK"
+        [ "$rc" -eq 0 ] || exit "$rc"
+        [ -z "$normalize" ] || value="$("$normalize" "$value")"
+        if "$check" "$value"; then
+            break
+        fi
+        ui_invalid "Некорректное значение${value:+: $value}. Попробуйте ещё раз (назад: $(back_hint))."
+        [ "$UI" != gum ] || default="$value"
+    done
+    env_set "$var" "$value"
+    printf -v "$var" '%s' "$value"
+    ui_answer "$(field_label "$var")" "$value"
+}
+
+back_hint() {
+    if [ "$UI" = gum ]; then echo "Esc"; else echo "<"; fi
+}
+
+# Смена основного домена переносит поддомены вида x.старый-домен на новый
+ask_domain() {
+    local old rc=0 var value
+    old="$(env_get DOMAIN)"
+    ask DOMAIN "Основной домен (например, example.com)" is_domain normalize_domain || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    if [ -n "$old" ] && [ "$old" != "$DOMAIN" ]; then
+        for var in "${SUBDOMAINS[@]}"; do
+            value="$(env_get "$var")"
+            if [ -n "$value" ] && [ "${value%."$old"}" != "$value" ]; then
+                env_set "$var" "${value%."$old"}.$DOMAIN"
+            fi
+        done
+    fi
+}
+
+ask_xray() {
+    local value rc=0
+    value="$(env_get NEED_XRAY)"
+    if [ -n "$value" ] && [ -z "${ASKED_FIELDS[NEED_XRAY]:-}" ]; then
+        NEED_XRAY="$value"
+        return 0
+    fi
+    ASKED_FIELDS[NEED_XRAY]=1
+    ui_yes_no "Сервер в РФ и нужен Xray-прокси (потребуется ссылка vless://)?" "${value:-no}" || rc=$?
+    case "$rc" in
+        0) NEED_XRAY=yes ;;
+        1) NEED_XRAY=no ;;
+        *) return "$rc" ;;
+    esac
+    env_set NEED_XRAY "$NEED_XRAY"
+    ui_answer "Xray-прокси" "$(field_value NEED_XRAY)"
+}
+
+# Нужен ли вопрос сейчас: ссылка - только при Xray, поддомен Element Admin - только если она включена
+field_applicable() {
+    case "$1" in
+        VLESS_LINK) [ "$NEED_XRAY" = yes ] ;;
+        DOMAIN_ADMIN_PANEL) [ "$ELEMENT_ADMIN_ENABLED" = true ] ;;
+        *) return 0 ;;
+    esac
+}
+
+# ask_toggle ПЕРЕМЕННАЯ "вопрос" по_умолчанию(true|false) -> 0 / 2 (назад). Значение: true или false.
+# Если ответы идут не с клавиатуры, вопрос не задаётся (порядок ответов через stdin не меняется).
+ask_toggle() {
+    local var="$1" question="$2" def="$3" value rc=0
+    value="$(env_get "$var")"
+    if [ -n "$value" ] && [ -z "${ASKED_FIELDS[$var]:-}" ]; then
+        printf -v "$var" '%s' "$value"
+        return 0
+    fi
+    if [ ! -t 0 ] && [ -z "$value" ]; then
+        env_set "$var" "$def"
+        printf -v "$var" '%s' "$def"
+        return 0
+    fi
+    ASKED_FIELDS[$var]=1
+    if [ "${value:-$def}" = true ]; then def=yes; else def=no; fi
+    ui_yes_no "$question" "$def" || rc=$?
+    case "$rc" in
+        0) value=true ;;
+        1) value=false ;;
+        *) return "$rc" ;;
+    esac
+    env_set "$var" "$value"
+    printf -v "$var" '%s' "$value"
+    ui_answer "$(field_label "$var")" "$(field_value "$var")"
+}
+
+ask_admin_nick() {
+    local value rc
+    while true; do
+        rc=0
+        value="$(prompt_value "Логин админа (строчные латинские буквы, цифры, символы ._=-)" "${ADMIN_NICK:-admin}")" || rc=$?
+        [ "$rc" -ne "$BACK" ] || return "$BACK"
+        [ "$rc" -eq 0 ] || exit "$rc"
+        if is_nick "$value"; then
+            break
+        fi
+        ui_invalid "Некорректный логин. Попробуйте ещё раз (назад: $(back_hint))."
+    done
+    ADMIN_NICK="$value"
+    ui_answer "Логин админа" "$value"
+}
+
+ask_admin_pass() {
+    local value rc
+    while true; do
+        rc=0
+        value="$(prompt_value "Пароль админа (от 12 символов: строчные и заглавные буквы, цифры; Enter — сгенерировать)" "" secret)" || rc=$?
+        [ "$rc" -ne "$BACK" ] || return "$BACK"
+        [ "$rc" -eq 0 ] || exit "$rc"
+        if [ -z "$value" ]; then
+            ADMIN_PASS="$(openssl rand -base64 24 | tr -d '+/=\n')"
+            ADMIN_PASS_GENERATED=yes
+            ui_answer "Пароль админа" "будет сгенерирован и показан в конце"
+            [ "$UI" = gum ] || echo "  Пароль сгенерирован, он будет показан в конце установки."
+            return 0
+        fi
+        if is_password "$value"; then
+            break
+        fi
+        ui_invalid "Слишком простой пароль: нужно от 12 символов, строчные и заглавные буквы, цифры, без пробелов (назад: $(back_hint))."
+    done
+    ADMIN_PASS="$value"
+    ADMIN_PASS_GENERATED=no
+    ui_answer "Пароль админа" "задан"
+}
+
+# ask_field ПОЛЕ -> 0 ответ принят, 2 назад, 3 вопрос сейчас не нужен
+ask_field() {
+    case "$1" in
+        YOUR_IP) ask YOUR_IP "IP (v4) сервера" is_ipv4 "" "$(detect_ip)" ;;
+        DOMAIN) ask_domain ;;
+        DOMAIN_MATRIX) ask DOMAIN_MATRIX "Поддомен для Matrix" is_domain normalize_domain "mat.$DOMAIN" ;;
+        DOMAIN_WEB_CLIENT) ask DOMAIN_WEB_CLIENT "Поддомен для Element Web" is_domain normalize_domain "elem.$DOMAIN" ;;
+        KETESA_ENABLED) ask_toggle KETESA_ENABLED "Установить админку Ketesa (бывший synapse-admin)? Откроется на https://$DOMAIN_MATRIX/synapse-admin/" true ;;
+        ELEMENT_ADMIN_ENABLED) ask_toggle ELEMENT_ADMIN_ENABLED "Установить админку Element Admin? Нужен отдельный поддомен" true ;;
+        DOMAIN_ADMIN_PANEL)
+            field_applicable DOMAIN_ADMIN_PANEL || return "$SKIP"
+            ask DOMAIN_ADMIN_PANEL "Поддомен для Element Admin" is_domain normalize_domain "admin.$DOMAIN"
+            ;;
+        DOMAIN_COTURN) ask DOMAIN_COTURN "Поддомен для Coturn (звонки 1-на-1)" is_domain normalize_domain "turn.$DOMAIN" ;;
+        DOMAIN_CALL) ask DOMAIN_CALL "Поддомен для Element Call (групповые звонки)" is_domain normalize_domain "call.$DOMAIN" ;;
+        DOMAIN_NTFY) ask DOMAIN_NTFY "Поддомен для ntfy (push-уведомления)" is_domain normalize_domain "ntfy.$DOMAIN" ;;
+        ADMIN_EMAIL) ask ADMIN_EMAIL "Email для уведомлений Let's Encrypt" is_email ;;
+        NEED_XRAY) ask_xray ;;
+        VLESS_LINK)
+            if ! field_applicable VLESS_LINK; then
+                VLESS_LINK=""
+                return "$SKIP"
+            fi
+            ask VLESS_LINK "Ссылка vless:// для Xray" is_vless
+            ;;
+        ADMIN_NICK) ask_admin_nick ;;
+        ADMIN_PASS) ask_admin_pass ;;
+    esac
+}
+
+# Предыдущий вопрос для "назад" (результат в PREV_INDEX). Он открывается с сохранённым значением,
+# даже если в этом запуске не задавался (например, ответ остался в файле параметров с прошлого раза).
+PREV_INDEX=0
+prev_question() {
+    local i="$1" j f
+    for ((j = i - 1; j >= 0; j--)); do
+        f="${QUESTIONS[$j]}"
+        field_applicable "$f" || continue
+        ASKED_FIELDS[$f]=1
+        PREV_INDEX="$j"
+        return 0
+    done
+    ui_invalid "Это первый вопрос, назад некуда."
+    ASKED_FIELDS[${QUESTIONS[$i]}]=1
+    PREV_INDEX="$i"
+}
+
+# Проходит вопросы с индекса $1. "Назад" возвращает к предыдущему вопросу.
+run_questions() {
+    local i="$1" n="${#QUESTIONS[@]}" rc
+    while [ "$i" -lt "$n" ]; do
+        rc=0
+        ask_field "${QUESTIONS[$i]}" || rc=$?
+        if [ "$rc" -eq "$BACK" ]; then
+            prev_question "$i"
+            i="$PREV_INDEX"
+            continue
+        fi
+        [ "$rc" -eq 0 ] || [ "$rc" -eq "$SKIP" ] || exit "$rc"
+        i=$((i + 1))
+    done
+}
+
+# Таблица параметров. show_answers [numbered] - с номерами строк для правки в текстовом режиме.
+# Список показанных полей остаётся в SHOWN_FIELDS.
+SHOWN_FIELDS=()
+show_answers() {
+    local numbered="${1:-}" rows=() f i
+    SHOWN_FIELDS=()
+    for f in "${QUESTIONS[@]}"; do
+        field_applicable "$f" || continue
+        SHOWN_FIELDS+=("$f")
+    done
+    for i in "${!SHOWN_FIELDS[@]}"; do
+        if [ -n "$numbered" ]; then
+            rows+=("$((i + 1)). $(field_label "${SHOWN_FIELDS[$i]}")" "$(field_value "${SHOWN_FIELDS[$i]}")")
+        else
+            rows+=("$(field_label "${SHOWN_FIELDS[$i]}")" "$(field_value "${SHOWN_FIELDS[$i]}")")
+        fi
+    done
+    ui_table "${rows[@]}"
+}
+
+# Экран проверки: 0 начать, 2 назад к последнему вопросу
+review_answers() {
+    local fields=() f i choice rc
+    while true; do
+        ui_section "Проверьте параметры"
+        if [ "$UI" = gum ]; then show_answers; else show_answers numbered; fi
+        fields=("${SHOWN_FIELDS[@]}")
+
+        if [ "$UI" = gum ]; then
+            rc=0
+            choice="$("$GUM" choose --header "Всё верно?" -- "Начать установку" "Исправить значение" "← Назад")" || rc=$?
+            case "$rc" in
+                0) ;;
+                1)
+                    clear_gum_line
+                    return "$BACK"
+                    ;;
+                *) cancel_input ;;
+            esac
+            case "$choice" in
+                "Начать установку") return 0 ;;
+                "← Назад") return "$BACK" ;;
+            esac
+            local labels=()
+            for f in "${fields[@]}"; do labels+=("$(field_label "$f") — $(field_value "$f")"); done
+            rc=0
+            choice="$("$GUM" choose --header "Что исправить?" -- "${labels[@]}")" || rc=$?
+            [ "$rc" -le 1 ] || cancel_input
+            [ "$rc" -eq 0 ] || clear_gum_line
+            [ "$rc" -eq 0 ] || continue
+            for i in "${!labels[@]}"; do
+                [ "${labels[$i]}" != "$choice" ] || f="${fields[$i]}"
+            done
+        else
+            read -r -p "Enter — начать установку, номер — исправить, < — назад: " choice || die "ввод закончился, а ответы ещё нужны"
+            [ -n "$choice" ] || return 0
+            [ "$choice" != "<" ] || return "$BACK"
+            if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#fields[@]}" ]; then
+                ui_invalid "Нет такого номера."
+                continue
+            fi
+            f="${fields[$((choice - 1))]}"
+        fi
+        edit_field "$f"
+    done
+}
+
+# Исправление одного поля с экрана проверки. "Назад" здесь просто возвращает к экрану.
+edit_field() {
+    local f="$1" rc=0
+    ASKED_FIELDS[$f]=1
+    ask_field "$f" || rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq "$BACK" ] || exit "$rc"
+    # Включили Xray - нужна ссылка; включили Element Admin - нужен поддомен
+    local need=""
+    if [ "$f" = NEED_XRAY ] && [ "$NEED_XRAY" = yes ] && [ -z "$(env_get VLESS_LINK)" ]; then
+        need=VLESS_LINK
+    elif [ "$f" = ELEMENT_ADMIN_ENABLED ] && [ "$ELEMENT_ADMIN_ENABLED" = true ] && [ -z "$(env_get DOMAIN_ADMIN_PANEL)" ]; then
+        need=DOMAIN_ADMIN_PANEL
+    fi
+    if [ -n "$need" ]; then
+        while true; do
+            rc=0
+            ask_field "$need" || rc=$?
+            [ "$rc" -eq "$BACK" ] || break
+        done
+    fi
+}
 
 collect_input() {
-    echo "=== Параметры сервера (сохраняются в $ENV_FILE) ==="
-    ask YOUR_IP            "IP (v4) сервера" is_ipv4
-    ask DOMAIN             "Основной домен (например, example.com)" is_domain normalize_domain
-    ask DOMAIN_MATRIX      "Поддомен для Matrix (например, mat.example.com)" is_domain normalize_domain
-    ask DOMAIN_WEB_CLIENT  "Поддомен для Element Web (например, elem.example.com)" is_domain normalize_domain
-    ask DOMAIN_ADMIN_PANEL "Поддомен для Element Admin (например, admin.example.com)" is_domain normalize_domain
-    ask DOMAIN_COTURN      "Поддомен для Coturn (например, turn.example.com)" is_domain normalize_domain
-    ask DOMAIN_CALL        "Поддомен для Element Call (например, call.example.com)" is_domain normalize_domain
-    ask DOMAIN_NTFY        "Поддомен для ntfy (например, ntfy.example.com)" is_domain normalize_domain
-    ask ADMIN_EMAIL        "Email для SSL-уведомлений (Let's Encrypt)" is_email
-
-    NEED_XRAY="$(env_get NEED_XRAY)"
-    if [ -z "$NEED_XRAY" ]; then
-        read -r -p "Ваш сервер находится в РФ и нужен Xray прокси (потребуется vless-ссылка)? [y/N]: " answer
-        if [[ "$answer" =~ ^[Yy]$ ]]; then
-            NEED_XRAY=yes
-        else
-            NEED_XRAY=no
-        fi
-        env_set NEED_XRAY "$NEED_XRAY"
+    ui_section "Параметры сервера"
+    note "Ответы сохраняются в $ENV_FILE. Enter принимает значение по умолчанию, $(back_hint) — назад."
+    local rc
+    run_questions 0
+    # Ответы не с клавиатуры (файл, другая программа): таблица только для журнала, без ожидания -
+    # иначе экран проверки съел бы следующую строку ввода.
+    if [ ! -t 0 ]; then
+        ui_section "Параметры установки"
+        show_answers
     fi
-
-    VLESS_LINK=""
-    if [ "$NEED_XRAY" = yes ]; then
-        ask VLESS_LINK "vless-ссылка (vless://uuid@host:port?params...)" is_vless
-    fi
+    # Экран проверки - при ручном вводе
+    while [ -t 0 ]; do
+        rc=0
+        review_answers || rc=$?
+        [ "$rc" -eq "$BACK" ] || break
+        # Назад с экрана проверки - к последнему вопросу
+        run_questions "$((${#QUESTIONS[@]} - 1))"
+    done
 
     # Секреты: генерируются один раз, потом берутся из .env
     ensure_secret GENERIC_SECRET
     ensure_secret DB_PASSWORD
     ensure_secret COTURN_SECRET
     ensure_secret MAS_ENC_KEY
-
-    echo "=== Администратор Matrix (в .env не сохраняется) ==="
-    while true; do
-        read -r -p "Логин админа (нижний регистр, латиница/цифры, символы ._=-): " ADMIN_NICK
-        is_nick "$ADMIN_NICK" && break
-        echo "  Некорректный логин."
-    done
-    while true; do
-        read -rs -p "Пароль админа (от 12 символов, строчные и заглавные буквы и цифры; Enter — сгенерировать): " ADMIN_PASS
-        echo
-        if [ -z "$ADMIN_PASS" ]; then
-            ADMIN_PASS="$(openssl rand -base64 24 | tr -d '+/=\n')"
-            echo "  Пароль сгенерирован, он будет показан в конце установки."
-            break
-        fi
-        is_password "$ADMIN_PASS" && break
-        echo "  Слишком простой пароль: нужно от 12 символов, строчные и заглавные буквы, цифры, без пробелов."
-    done
 }
 
 # ---------- шаг 2: базовые пакеты и swap ----------
 
 install_base() {
-    echo "=== Базовые пакеты ==="
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get upgrade -y
@@ -369,9 +1028,8 @@ install_base() {
 }
 
 setup_swap() {
-    echo "=== Swap ==="
     if swapon --show=NAME --noheadings | grep -qx /swapfile; then
-        echo "Swap-файл уже включён, пропускаем"
+        note "Swap-файл уже включён"
         return 0
     fi
     if [ ! -f /swapfile ]; then
@@ -389,7 +1047,6 @@ setup_swap() {
 # ---------- шаг 3: Xray (только если нужен) ----------
 
 setup_xray() {
-    echo "=== Xray ==="
     download "$RAW_BASE/scripts/dependency/xray_outbound_parsing.js" "$WORK_DIR/xray_outbound_parsing.js"
     download "$RAW_BASE/scripts/dependency/xray_util.js" "$WORK_DIR/xray_util.js"
     download "$RAW_BASE/scripts/dependency/xray_configurator.js" "$WORK_DIR/xray_configurator.js"
@@ -424,7 +1081,7 @@ setup_xray() {
     # Проверяем, что через прокси реально есть выход. Неудача не фатальна: VLESS-сервер мог
     # прилечь на минуту, а загрузки дальше сами делают повторы.
     if run_with_retry "curl -fsS -o /dev/null --max-time 15 -x http://127.0.0.1:${PROXY_PORT} https://github.com" 3; then
-        echo "Xray установлен и работает"
+        note "Xray работает, выход через прокси проверен"
     else
         warn "Xray запущен, но через него не открывается https://github.com. Проверьте ссылку vless:// и доступность вашего VLESS-сервера. Установка продолжится, но загрузки могут падать."
     fi
@@ -454,67 +1111,101 @@ NO_PROXY="$no_proxy_list"
 EOF
     install -m 644 "$env_tmp" /etc/environment
 
-    # Прокси для докера
-    mkdir -p /etc/systemd/system/docker.service.d
-    cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<EOF
+    # Прокси для докера. Docker перезапускается, только если настройка действительно изменилась.
+    local dropin=/etc/systemd/system/docker.service.d/http-proxy.conf dropin_tmp
+    dropin_tmp="$(mktemp "$WORK_DIR/docker-proxy.XXXXXX")"
+    cat > "$dropin_tmp" <<EOF
 [Service]
 Environment="HTTP_PROXY=http://${DOCKER_BRIDGE_IP}:${PROXY_PORT}"
 Environment="HTTPS_PROXY=http://${DOCKER_BRIDGE_IP}:${PROXY_PORT}"
 Environment="NO_PROXY=localhost,127.0.0.1,::1,${YOUR_IP},${DOMAIN},.${DOMAIN},172.16.0.0/12,10.0.0.0/8,fd42:f167:100f::/48"
 EOF
+    if ! cmp -s "$dropin_tmp" "$dropin"; then
+        mkdir -p "$(dirname "$dropin")"
+        install -m 644 "$dropin_tmp" "$dropin"
+        DOCKER_RESTART=yes
+    fi
 }
 
 # ---------- шаг 4: docker, ansible, репозиторий плейбука ----------
 
+DOCKER_RESTART=no
+
 install_docker() {
-    echo "=== Docker ==="
-    run_with_retry "curl -fsSL https://get.docker.com | sh"
+    # Установщик get.docker.com при уже установленном Docker ждёт 20 секунд и переустанавливает пакеты,
+    # а перезапуск Docker останавливает все контейнеры Matrix - поэтому повторно не запускаем.
+    if command -v docker > /dev/null 2>&1 && systemctl cat docker.service > /dev/null 2>&1; then
+        note "Docker уже установлен: $(docker --version 2> /dev/null | sed 's/,.*//')"
+    else
+        run_with_retry "curl -fsSL https://get.docker.com | sh"
+        DOCKER_RESTART=yes
+    fi
     systemctl enable --now docker
-    systemctl daemon-reload
-    systemctl restart docker
-    echo "Подготовка образа Element Admin..."
-    run_with_retry "docker pull oci.element.io/element-admin:latest"
+    if [ "$DOCKER_RESTART" = yes ]; then
+        systemctl daemon-reload
+        systemctl restart docker
+    fi
+    if [ "$ELEMENT_ADMIN_ENABLED" = true ]; then
+        echo "Подготовка образа Element Admin..."
+        run_with_retry "docker pull oci.element.io/element-admin:latest"
+    fi
+}
+
+# Свежий just с just.systems в /usr/local/bin (он в PATH раньше /usr/bin)
+install_just_upstream() {
+    run_with_retry "curl --proto '=https' --tlsv1.2 -fsS https://just.systems/install.sh | bash -s -- --force --to /usr/local/bin" 5
 }
 
 install_ansible() {
-    echo "=== Ansible и just ==="
-    add-apt-repository --yes --update ppa:ansible/ansible
-    if ! command -v just > /dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
-    fi
+    run_with_retry "add-apt-repository --yes --update ppa:ansible/ansible" 5
     apt-get install -y ansible
+    # just: сначала из репозитория Ubuntu (24.04+), иначе с just.systems.
+    # Подходит ли версия к justfile плейбука, проверяется после клонирования (ensure_just_works).
+    if ! command -v just > /dev/null 2>&1; then
+        apt-get install -y just || install_just_upstream || die "не удалось установить just"
+    fi
+}
+
+# Старый just (например, из репозитория Ubuntu) может не понять justfile плейбука - тогда ставим свежий
+ensure_just_works() {
+    if just --list > /dev/null 2>&1; then
+        return 0
+    fi
+    note "just $(just --version 2> /dev/null | awk '{print $2}') не читает justfile плейбука, ставим свежую версию"
+    install_just_upstream || die "не удалось установить подходящую версию just"
+    hash -r
+    just --list > /dev/null || die "just не читает justfile плейбука в $REPO_DIR"
 }
 
 # Плейбук фиксируется на PLAYBOOK_COMMIT. Уже установленный плейбук новее этой версии
 # не откатывается: откат может сломать базу данных Synapse.
 clone_playbook() {
-    echo "=== Плейбук matrix-docker-ansible-deploy ==="
     if [ ! -d "$REPO_DIR/.git" ]; then
         [ ! -e "$REPO_DIR" ] || die "$REPO_DIR существует, но это не git-репозиторий. Переименуйте его и запустите скрипт снова"
         local partial="$REPO_DIR.partial"
         run_with_retry "rm -rf '$partial' && git clone -q '$PLAYBOOK_REPO' '$partial'"
         mv "$partial" "$REPO_DIR"
         git -C "$REPO_DIR" checkout -q "$PLAYBOOK_COMMIT"
-        echo "Плейбук зафиксирован на коммите $PLAYBOOK_COMMIT ($PLAYBOOK_VERSION)"
+        note "Плейбук зафиксирован на версии $PLAYBOOK_VERSION"
     else
         run_with_retry "git -C '$REPO_DIR' fetch -q origin"
         if git -C "$REPO_DIR" merge-base --is-ancestor "$PLAYBOOK_COMMIT" HEAD; then
-            echo "Плейбук в $REPO_DIR уже не старше проверенной версии, оставляем его как есть"
+            note "Плейбук уже не старше версии $PLAYBOOK_VERSION, оставлен как есть"
         else
             git -C "$REPO_DIR" checkout -q "$PLAYBOOK_COMMIT" \
                 || die "не удалось переключить плейбук на $PLAYBOOK_COMMIT: в $REPO_DIR есть локальные изменения"
-            echo "Плейбук переключён на коммит $PLAYBOOK_COMMIT ($PLAYBOOK_VERSION)"
+            note "Плейбук переключён на версию $PLAYBOOK_VERSION"
         fi
     fi
     cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
     # 'just update' сделал бы git pull и ушёл с зафиксированной версии, поэтому только роли
+    ensure_just_works
     run_with_retry "just roles"
 }
 
 # ---------- шаг 5: inventory и vars.yml из шаблона ----------
 
 render_inventory() {
-    echo "=== Конфиг ansible ==="
     mkdir -p "inventory/host_vars/$DOMAIN_MATRIX"
     printf '[matrix_servers]\n%s ansible_host=127.0.0.1 ansible_connection=local\n' "$DOMAIN_MATRIX" > inventory/hosts
 
@@ -526,14 +1217,14 @@ render_inventory() {
         local backup
         backup="$out.bak-$(date +%Y%m%d-%H%M%S)"
         cp -p "$out" "$backup"
-        echo "Прошлый vars.yml сохранён: $REPO_DIR/$backup"
+        note "Прошлый vars.yml сохранён: $REPO_DIR/$backup"
     fi
 
-    python3 - "$WORK_DIR/vars.yml.tpl" "$ENV_FILE" "$out" "$NEED_XRAY" <<'PY' || die "не удалось собрать vars.yml"
+    python3 - "$WORK_DIR/vars.yml.tpl" "$ENV_FILE" "$out" "$NEED_XRAY" "$ELEMENT_ADMIN_ENABLED" <<'PY' || die "не удалось собрать vars.yml"
 import re
 import sys
 
-template_path, env_path, out_path, need_xray = sys.argv[1:5]
+template_path, env_path, out_path, need_xray, element_admin = sys.argv[1:6]
 
 values = {}
 with open(env_path, encoding="utf-8") as f:
@@ -542,17 +1233,15 @@ with open(env_path, encoding="utf-8") as f:
         if m:
             values[m.group(1)] = m.group(2)
 
-# Блоки между маркерами нужны только при использовании Xray
-keep_xray = need_xray == "yes"
+# Блоки между маркерами "# @ИМЯ_BEGIN" и "# @ИМЯ_END" попадают в файл, только если они нужны
+keep = {"XRAY": need_xray == "yes", "ELEMENT_ADMIN": element_admin == "true"}
+block = re.compile(r"^# @([A-Z_]+)_(BEGIN|END)$")
 kept, skipping = [], False
 with open(template_path, encoding="utf-8") as f:
     for line in f:
-        marker = line.strip()
-        if marker == "# @XRAY_BEGIN":
-            skipping = not keep_xray
-            continue
-        if marker == "# @XRAY_END":
-            skipping = False
+        m = block.match(line.strip())
+        if m and m.group(1) in keep:
+            skipping = m.group(2) == "BEGIN" and not keep[m.group(1)]
             continue
         if not skipping:
             kept.append(line)
@@ -561,7 +1250,7 @@ text = "".join(kept)
 placeholder = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 missing = sorted({name for name in placeholder.findall(text) if not values.get(name)})
 if missing:
-    sys.exit("В .env не заполнены переменные: " + ", ".join(missing))
+    sys.exit("В файле параметров не заполнены переменные: " + ", ".join(missing))
 text = placeholder.sub(lambda m: values[m.group(1)], text)
 
 with open(out_path, "w", encoding="utf-8") as f:
@@ -591,14 +1280,13 @@ detect_ssh_ports() {
 }
 
 setup_firewall() {
-    echo "=== Firewall ==="
     local rule ssh_ports port
     ssh_ports="$(detect_ssh_ports || true)"
     [ -n "$ssh_ports" ] || ssh_ports=22
     for port in $ssh_ports; do
-        echo "Открываем SSH-порт $port"
         ufw allow "$port/tcp"
     done
+    note "SSH: открыт порт $(printf '%s\n' "$ssh_ports" | paste -sd, -)"
     for rule in 80/tcp 443/tcp 3478/tcp 3478/udp 5349/tcp 5349/udp \
                 7880/tcp 7881/tcp 7882/udp 8448/tcp 49152:49652/udp; do
         ufw allow "$rule"
@@ -614,18 +1302,24 @@ setup_firewall() {
 
 ADMIN_REGISTERED=no
 
-install_playbook() {
-    echo "Запускаем установку Matrix. Это займет ~30 минут..."
+
+setup_xray_and_proxy() {
+    setup_xray
+    setup_proxy
+}
+
+install_matrix() {
     # Повторы помогают при сетевых сбоях. Ошибки DNS и сертификатов они не лечат,
     # поэтому попыток мало, а при неудаче выводим, что проверить.
     run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
-        || die "установка Matrix не удалась (подробности выше). Частые причины:
-  - DNS-записи доменов ($DOMAIN, $DOMAIN_MATRIX, $DOMAIN_WEB_CLIENT, $DOMAIN_ADMIN_PANEL, $DOMAIN_COTURN, $DOMAIN_CALL, $DOMAIN_NTFY) не указывают на $YOUR_IP;
+        || die "установка Matrix не удалась. Частые причины:
+  - DNS-записи доменов ($DOMAIN, $DOMAIN_MATRIX, $DOMAIN_WEB_CLIENT${DOMAIN_ADMIN_PANEL:+, $DOMAIN_ADMIN_PANEL}, $DOMAIN_COTURN, $DOMAIN_CALL, $DOMAIN_NTFY) не указывают на $YOUR_IP;
   - порты 80 и 443 недоступны из интернета, и Let's Encrypt не может выдать сертификаты.
 После исправления повторите: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start
 Или запустите этот скрипт снова: значения и секреты возьмутся из $ENV_FILE"
+}
 
-    echo "=== Регистрация администратора ==="
+register_admin() {
     # Пароль передаётся файлом, а не в командной строке (в командной строке он виден в ps)
     local vars_file="$WORK_DIR/admin-vars.json"
     (umask 077 && python3 -c 'import json,sys; print(json.dumps({"username": sys.argv[1], "password": sys.argv[2], "admin": "yes"}))' "$ADMIN_NICK" "$ADMIN_PASS" > "$vars_file")
@@ -633,32 +1327,316 @@ install_playbook() {
     if ansible-playbook -i inventory/hosts setup.yml --extra-vars "@$vars_file" --tags=register-user; then
         ADMIN_REGISTERED=yes
     else
-        warn "администратор не зарегистрирован (подробности выше)"
+        warn "администратор не зарегистрирован: такой пользователь уже есть, или MAS счёл пароль слишком простым"
     fi
+    rm -f "$vars_file"
 }
 
 print_summary() {
-    printf "\n\n\n%s\n\n" "Установка завершена!"
-    if [ "$NEED_XRAY" = yes ]; then
-        printf "Ваш XRAY-конфиг доступен по пути:\n%s\n\n" "/usr/local/etc/xray/config.json"
-    else
-        printf "Вы отказались от установки XRAY\n\n"
-    fi
-    printf "Ваш ansible-конфиг доступен по пути:\n%s\n\n" "$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
-    printf "Ваши параметры и секреты (для повторных запусков, не теряйте):\n%s\n\n" "$ENV_FILE"
-    printf "Команда для повторного запуска ansible (если будете менять vars.yml):\n%s\n\n" \
-        "cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
-    printf "Учтите: повторный запуск этого скрипта пересоздаёт vars.yml из шаблона, прошлый файл сохраняется рядом (vars.yml.bak-ДАТА).\n\n"
-    printf "Адрес вашего homeserver Matrix:\n%s\n\n" "$DOMAIN_MATRIX"
-    printf "Адрес вашего web-клиента Matrix:\n%s\n\n" "$DOMAIN_WEB_CLIENT"
-    printf "Адрес вашей админки Matrix:\n%s\n\n" "$DOMAIN_ADMIN_PANEL"
-    printf "Никнейм админа:\n%s\n\n" "$ADMIN_NICK"
-    printf "Пароль админа:\n%s\n\n" "$ADMIN_PASS"
+    local config="$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml" pass_shown="$ADMIN_PASS"
+    # Пароль, который не удалось применить, показывать нельзя: у существующего админа остался старый
+    [ "$ADMIN_REGISTERED" = yes ] || pass_shown="не применён (см. предупреждение ниже)"
+    ui_section "Установка завершена!"
+    ui_table \
+        "Matrix (homeserver)" "https://$DOMAIN_MATRIX" \
+        "Element Web" "https://$DOMAIN_WEB_CLIENT" \
+        "Админка Ketesa" "$(if [ "$KETESA_ENABLED" = true ]; then echo "https://$DOMAIN_MATRIX/synapse-admin/"; else echo "не установлена"; fi)" \
+        "Админка Element Admin" "$(if [ "$ELEMENT_ADMIN_ENABLED" = true ]; then echo "https://$DOMAIN_ADMIN_PANEL"; else echo "не установлена"; fi)" \
+        "Логин админа" "$ADMIN_NICK" \
+        "Пароль админа" "$pass_shown" \
+        "Xray" "$(if [ "$NEED_XRAY" = yes ]; then echo /usr/local/etc/xray/config.json; else echo "не используется"; fi)" \
+        "Конфиг ansible" "$config" \
+        "Параметры и секреты" "$ENV_FILE (не теряйте)"
+    note "Применить ручные правки vars.yml: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+    note "Панель управления: sudo matrix-up   Обновление: sudo matrix-up --update"
+    note "Переустановка (matrix-up --install или пункт панели) пересоздаёт vars.yml из шаблона, прошлый файл: vars.yml.bak-ДАТА. --update его не трогает."
+    [ "$UI" != gum ] || note "Журнал установки: $LOG_FILE"
     if [ "$ADMIN_REGISTERED" != yes ]; then
-        warn "администратор не зарегистрирован. Частые причины: такой пользователь уже есть, или MAS счёл пароль слишком простым."
-        printf "Зарегистрировать вручную:\n%s\n\n" \
-            "cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --extra-vars='username=ЛОГИН password=ПАРОЛЬ admin=yes' --tags=register-user"
+        warn "администратор $ADMIN_NICK не зарегистрирован. Если такой пользователь уже был, его пароль остался прежним. Другая частая причина: MAS счёл пароль слишком простым."
+        note "Зарегистрировать вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --extra-vars='username=ЛОГИН password=ПАРОЛЬ admin=yes' --tags=register-user"
     fi
+}
+
+# ---------- системная команда и параметры ----------
+
+# Копирует скрипт в INSTALL_DIR и создаёт команды matrix-up и matrix_up.
+# Более новую уже установленную версию не заменяет.
+install_self() {
+    local installed_tag="" name link
+    if [ "$SCRIPT_PATH" != "$INSTALLED_SCRIPT" ] && [ -f "$SCRIPT_PATH" ]; then
+        if [ -f "$INSTALLED_SCRIPT" ]; then
+            installed_tag="$(sed -n 's/^RELEASE_TAG="\(.*\)"$/\1/p' "$INSTALLED_SCRIPT" | head -1)"
+        fi
+        if [ -n "$installed_tag" ] && [ "$(printf '%s\n%s\n' "$installed_tag" "$RELEASE_TAG" | sort -V | tail -1)" != "$RELEASE_TAG" ]; then
+            note "Команда matrix-up оставлена на более новой версии $installed_tag"
+        elif install -D -m 755 "$SCRIPT_PATH" "$INSTALLED_SCRIPT.new" 2> /dev/null && mv -f "$INSTALLED_SCRIPT.new" "$INSTALLED_SCRIPT"; then
+            [ "$installed_tag" = "$RELEASE_TAG" ] || note "Скрипт установлен в систему: команда matrix-up (или matrix_up)"
+        else
+            rm -f "$INSTALLED_SCRIPT.new"
+            warn "не удалось установить скрипт в $INSTALL_DIR, команда matrix-up недоступна"
+            return 0
+        fi
+    fi
+    [ -f "$INSTALLED_SCRIPT" ] || return 0
+    for name in "${COMMAND_NAMES[@]}"; do
+        link="$BIN_DIR/$name"
+        # Чужой файл с таким именем не трогаем
+        if [ -e "$link" ] && [ "$(readlink -f "$link")" != "$INSTALLED_SCRIPT" ]; then
+            warn "$link уже существует и это не наш скрипт, команда $name не создана"
+            continue
+        fi
+        ln -sfn "$INSTALLED_SCRIPT" "$link" 2> /dev/null || warn "не удалось создать команду $link"
+    done
+}
+
+# Файл параметров в CONFIG_DIR. Параметры прошлых версий (.env рядом со скриптом) переносятся.
+prepare_env_file() {
+    install -d -m 700 "$CONFIG_DIR" || die "не удалось создать $CONFIG_DIR"
+    if [ ! -s "$ENV_FILE" ] && [ -s "$OLD_ENV_FILE" ]; then
+        cp "$OLD_ENV_FILE" "$ENV_FILE" || die "не удалось перенести $OLD_ENV_FILE в $ENV_FILE"
+        note "Параметры перенесены из $OLD_ENV_FILE в $ENV_FILE (старый файл больше не используется)"
+    fi
+    touch "$ENV_FILE" || die "не удалось создать $ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
+
+# Есть ли уже установленный Matrix (конфиг плейбука)
+has_installation() {
+    compgen -G "$(find_repo_dir)/inventory/host_vars/*/vars.yml" > /dev/null
+}
+
+# ---------- панель управления (пункты будут расширяться) ----------
+
+# ui_menu "заголовок" пункт... -> печатает выбранный пункт; код 2 - Esc/назад
+ui_menu() {
+    local header="$1" choice rc=0 i
+    shift
+    if [ "$UI" = gum ]; then
+        choice="$("$GUM" choose --header "$header" -- "$@")" || rc=$?
+        case "$rc" in
+            0) printf '%s' "$choice" ;;
+            1)
+                clear_gum_line
+                return "$BACK"
+                ;;
+            *) cancel_input ;;
+        esac
+        return 0
+    fi
+    printf '\n%s\n' "$header" >&9
+    for ((i = 1; i <= $#; i++)); do
+        printf '  %d. %s\n' "$i" "${!i}" >&9
+    done
+    while true; do
+        read -r -p "Номер пункта: " choice || die "ввод закончился"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le $# ]; then
+            printf '%s' "${!choice}"
+            return 0
+        fi
+        ui_invalid "Нет такого пункта."
+    done
+}
+
+panel_status() {
+    local units active failed failed_list xray docker_state disk repo
+    units="$(systemctl list-units 'matrix-*' --all --no-legend --plain 2> /dev/null || true)"
+    active="$(awk '$3 == "active"' <<< "$units" | grep -c . || true)"
+    failed="$(awk '$3 == "failed"' <<< "$units" | grep -c . || true)"
+    failed_list="$(awk '$3 == "failed" {print $1}' <<< "$units" | paste -sd, - || true)"
+    if command -v xray > /dev/null 2>&1 || [ -x /usr/local/bin/xray ]; then
+        xray="$(systemctl is-active xray 2> /dev/null || true)"
+    else
+        xray="не установлен"
+    fi
+    docker_state="$(systemctl is-active docker 2> /dev/null || true)"
+    disk="$(df -h / | awk 'NR == 2 {print $3 " из " $2 " (" $5 ")"}')"
+    repo="$(find_repo_dir)"
+    find_single_config
+    local ketesa element_admin fqn
+    fqn="$(yaml_value "$PANEL_CONFIG" matrix_server_fqn_matrix)"
+    if [ "$(yaml_value "$PANEL_CONFIG" matrix_ketesa_enabled)" = true ]; then
+        ketesa="https://$fqn/synapse-admin/"
+    else
+        ketesa="не установлена"
+    fi
+    if [ "$(yaml_value "$PANEL_CONFIG" matrix_element_admin_enabled)" = true ]; then
+        element_admin="https://$(yaml_value "$PANEL_CONFIG" matrix_element_admin_hostname)"
+    else
+        element_admin="не установлена"
+    fi
+    ui_section "Состояние"
+    ui_table \
+        "Сервисы Matrix" "работают: $active, с ошибкой: $failed" \
+        "С ошибкой" "${failed_list:-нет}" \
+        "Docker" "${docker_state:-неизвестно}" \
+        "Xray" "${xray:-неизвестно}" \
+        "Ketesa" "$ketesa" \
+        "Element Admin" "$element_admin" \
+        "Диск /" "$disk" \
+        "Плейбук" "$repo ($(git -C "$repo" rev-parse --short HEAD 2> /dev/null || echo "?"))" \
+        "Скрипт" "$RELEASE_TAG"
+}
+
+panel_log() {
+    local log="/var/log/matrix_up.log"
+    if [ ! -s "$log" ]; then
+        PANEL_MSG="Журнала установки ещё нет ($log)"
+        return 0
+    fi
+    if [ "$UI" = gum ]; then
+        "$GUM" pager < "$log" || true
+    else
+        tail -n 40 "$log"
+        read -r -p "Enter — назад в панель " _ || true
+    fi
+}
+
+# Запуск другого режима этого же скрипта (рабочая папка текущего процесса больше не нужна)
+panel_exec() {
+    ui_clear
+    rm -rf "$WORK_DIR"
+    WORK_DIR=""
+    exec bash "$SCRIPT_PATH" "$@"
+}
+
+PANEL_MSG=""
+
+# Единственный конфиг установленного плейбука (результат в PANEL_CONFIG)
+PANEL_CONFIG=""
+find_single_config() {
+    local repo f configs=()
+    repo="$(find_repo_dir)"
+    for f in "$repo"/inventory/host_vars/*/vars.yml; do
+        [ -f "$f" ] && configs+=("$f")
+    done
+    [ "${#configs[@]}" -gt 0 ] || die "установка не найдена (нет $repo/inventory/host_vars/*/vars.yml)"
+    [ "${#configs[@]}" -eq 1 ] || die "в $repo/inventory/host_vars несколько конфигов, правьте вручную: ${configs[*]}"
+    PANEL_CONFIG="${configs[0]}"
+}
+
+# yaml_value файл ключ - значение верхнеуровневого ключа без кавычек (пусто, если ключа нет)
+yaml_value() {
+    sed -n "s/^$2:[[:space:]]*//p" "$1" | tail -1 | sed -E "s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"']$//"
+}
+
+# yaml_set файл ключ значение - заменяет строку ключа или дописывает её в конец
+yaml_set() {
+    if grep -q "^$2:" "$1"; then
+        sed -i "s|^$2:.*|$2: $3|" "$1"
+    else
+        printf '\n%s: %s\n' "$2" "$3" >> "$1"
+    fi
+}
+
+# Плейбук целиком: setup-all удаляет выключенные сервисы (install-all их бы оставил)
+apply_setup_all() {
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start" 3 \
+        || die "плейбук завершился с ошибкой. Прошлый vars.yml сохранён рядом как vars.yml.bak-ДАТА.
+Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
+}
+
+# panel_toggle ketesa|element_admin - установить или удалить админку
+panel_toggle() {
+    local what="$1" key envkey label current new action process hostname="" rc=0
+    case "$what" in
+        ketesa) key=matrix_ketesa_enabled envkey=KETESA_ENABLED label="Ketesa" ;;
+        element_admin) key=matrix_element_admin_enabled envkey=ELEMENT_ADMIN_ENABLED label="Element Admin" ;;
+    esac
+    find_single_config
+    current="$(yaml_value "$PANEL_CONFIG" "$key")"
+    if [ "$current" = true ]; then
+        new=false action="Удалить" process="удаление"
+    else
+        new=true action="Установить" process="установка"
+    fi
+
+    if [ "$what" = element_admin ] && [ "$new" = true ]; then
+        hostname="$(yaml_value "$PANEL_CONFIG" matrix_element_admin_hostname)"
+        if [ -z "$hostname" ]; then
+            hostname="$(prompt_value "Поддомен для Element Admin (нужна DNS-запись на этот сервер)" "admin.$(yaml_value "$PANEL_CONFIG" matrix_domain)")" || rc=$?
+            [ "$rc" -ne "$BACK" ] || return 0
+            [ "$rc" -eq 0 ] || exit "$rc"
+            hostname="$(normalize_domain "$hostname")"
+            if ! is_domain "$hostname"; then
+                PANEL_MSG="Некорректный домен: $hostname"
+                return 0
+            fi
+        fi
+    fi
+    rc=0
+    ui_yes_no "$action админку $label? Плейбук применит изменения, это займёт 10–20 минут." yes || rc=$?
+    [ "$rc" -eq 0 ] || return 0
+
+    cp -p "$PANEL_CONFIG" "$PANEL_CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+    yaml_set "$PANEL_CONFIG" "$key" "$new"
+    [ -z "$hostname" ] || yaml_set "$PANEL_CONFIG" matrix_element_admin_hostname "\"$hostname\""
+    # Запоминаем выбор для переустановки
+    if [ -s "$ENV_FILE" ]; then
+        env_set "$envkey" "$new"
+        [ -z "$hostname" ] || env_set DOMAIN_ADMIN_PANEL "$hostname"
+    fi
+
+    REPO_DIR="$(find_repo_dir)"
+    cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
+    load_proxy_env
+    ui_clear
+    ui_banner "Matrix · $process админки $label" "изменён $PANEL_CONFIG (прошлый: vars.yml.bak-ДАТА)"
+    STEP_NO=0
+    STEP_TOTAL=1
+    STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
+    run_step "Применение настроек (setup-all)" apply_setup_all
+    STEP_HINT=""
+    if [ "$new" = true ]; then
+        PANEL_MSG="Админка $label установлена"
+    else
+        PANEL_MSG="Админка $label удалена"
+    fi
+}
+
+# Подпись пункта меню по текущему состоянию
+admin_menu_label() {
+    local key="$1" label="$2"
+    if [ "$(yaml_value "$PANEL_CONFIG" "$key")" = true ]; then
+        echo "Удалить админку $label"
+    else
+        echo "Установить админку $label"
+    fi
+}
+
+# Панель перерисовывается целиком при каждом показе меню: заголовок, состояние, сообщение, меню
+run_panel() {
+    local choice rc server_name ketesa_item element_admin_item
+    server_name="$(sed -n 's/^matrix_server_fqn_matrix:[[:space:]]*"\{0,1\}\([^" #]*\).*/\1/p' "$(find_repo_dir)"/inventory/host_vars/*/vars.yml 2> /dev/null | head -1)"
+    while true; do
+        ui_clear
+        ui_banner "Matrix · панель управления" "${server_name:-сервер Matrix} · версия скрипта: $RELEASE_TAG"
+        panel_status
+        if [ -n "$PANEL_MSG" ]; then
+            note "$PANEL_MSG"
+            PANEL_MSG=""
+        fi
+        rc=0
+        ketesa_item="$(admin_menu_label matrix_ketesa_enabled "Ketesa")"
+        element_admin_item="$(admin_menu_label matrix_element_admin_enabled "Element Admin")"
+        choice="$(ui_menu "Что сделать?" \
+            "Обновить состояние" \
+            "Обновить Matrix" \
+            "$ketesa_item" \
+            "$element_admin_item" \
+            "Изменить параметры и переустановить" \
+            "Журнал последней установки" \
+            "Выход")" || rc=$?
+        [ "$rc" -eq 0 ] || exit 0
+        case "$choice" in
+            "Обновить состояние") ;;
+            *"админку Ketesa") panel_toggle ketesa ;;
+            *"админку Element Admin") panel_toggle element_admin ;;
+            "Обновить Matrix") panel_exec --update ;;
+            "Изменить параметры и переустановить") panel_exec --install ;;
+            "Журнал последней установки") panel_log ;;
+            *) exit 0 ;;
+        esac
+    done
 }
 
 # ---------- режим --update ----------
@@ -683,7 +1661,7 @@ bump_validated_version() {
     local file="$1" current
     current="$(sed -n 's/^matrix_playbook_migration_validated_version:[[:space:]]*//p' "$file" | tr -d "\"' \r" | tail -1)"
     if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$PLAYBOOK_VERSION" | sort -V | tail -1)" = "$current" ]; then
-        echo "В vars.yml проверенная версия плейбука $current, менять не нужно"
+        note "В vars.yml версия плейбука $current, менять не нужно"
         return
     fi
     cp -p "$file" "$file.bak-$(date +%Y%m%d-%H%M%S)"
@@ -692,7 +1670,7 @@ bump_validated_version() {
     else
         printf '\nmatrix_playbook_migration_validated_version: %s\n' "$PLAYBOOK_VERSION" >> "$file"
     fi
-    echo "В vars.yml проверенная версия плейбука: ${current:-не задана} -> $PLAYBOOK_VERSION (прошлый файл сохранён рядом как vars.yml.bak-ДАТА)"
+    note "В vars.yml версия плейбука: ${current:-не задана} → $PLAYBOOK_VERSION (прошлый файл: vars.yml.bak-ДАТА)"
 }
 
 # Переход на последний релиз скрипта той же мажорной версии (только в режиме --update).
@@ -717,7 +1695,7 @@ self_update() {
     fi
 
     local self new
-    self="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+    self="$SCRIPT_PATH"
     new="$WORK_DIR/matrix_up.sh.new"
     if ! curl -fsSL "$RAW_ROOT/$latest/scripts/matrix_up.sh" -o "$new"; then
         warn "не удалось скачать скрипт $latest, продолжаем с $RELEASE_TAG"
@@ -739,10 +1717,18 @@ self_update() {
     exec bash "$self" --update --no-self-update
 }
 
+update_matrix() {
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
+        || die "обновление не удалось. Прошлый vars.yml сохранён рядом с ${UPDATE_CONFIG} как vars.yml.bak-ДАТА.
+Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
+}
+
 run_update() {
     load_proxy_env
     self_update
-    echo "=== Обновление Matrix до версии плейбука из релиза $RELEASE_TAG ($PLAYBOOK_VERSION) ==="
+    ui_init
+    ui_banner "Matrix · обновление · версия скрипта: $RELEASE_TAG" "плейбук matrix-docker-ansible-deploy $PLAYBOOK_VERSION"
+    install_self
     REPO_DIR="$(find_repo_dir)"
     local configs=()
     local f
@@ -756,47 +1742,71 @@ run_update() {
     for cmd in ansible-playbook just docker git; do
         command -v "$cmd" > /dev/null || die "не найдена команда $cmd. Запустите скрипт без --update, он доустановит недостающее"
     done
+    UPDATE_CONFIG="${configs[0]}"
 
-    clone_playbook
-    bump_validated_version "${configs[0]}"
+    STEP_TOTAL=3
+    run_step "Плейбук и роли" clone_playbook
+    run_step "Версия плейбука в vars.yml" bump_validated_version "$UPDATE_CONFIG"
+    STEP_HINT="до 30 минут, подробности: tail -f $LOG_FILE"
+    run_step "Обновление Matrix" update_matrix
+    STEP_HINT=""
 
-    echo "Запускаем обновление Matrix. Это может занять ~30 минут..."
-    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
-        || die "обновление не удалось (подробности выше). Прошлый vars.yml сохранён рядом с ${configs[0]} как vars.yml.bak-ДАТА.
-Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
-
-    printf "\n\nОбновление завершено!\n\n"
-    printf "Плейбук: %s (коммит %s)\n" "$REPO_DIR" "$(git -C "$REPO_DIR" rev-parse --short HEAD)"
-    printf "Конфиг: %s\n\n" "${configs[0]}"
+    ui_section "Обновление завершено!"
+    ui_table \
+        "Плейбук" "$REPO_DIR" \
+        "Версия" "$PLAYBOOK_VERSION (коммит $(git -C "$REPO_DIR" rev-parse --short HEAD))" \
+        "Конфиг" "$UPDATE_CONFIG"
 }
 
 # ---------- главный сценарий ----------
+
+# Без параметров: на установленном сервере при ручном запуске - панель, иначе установка
+if [ "$MODE" = auto ]; then
+    if [ -t 0 ] && has_installation; then
+        MODE=panel
+    else
+        MODE=install
+    fi
+fi
 
 if [ "$MODE" = update ]; then
     run_update
     exit 0
 fi
 
+if [ "$MODE" = panel ]; then
+    ui_init
+    install_self
+    run_panel
+    exit 0
+fi
+
+ui_init
+ui_banner "Matrix · установка · версия скрипта: $RELEASE_TAG" "Synapse, Element, звонки и уведомления через matrix-docker-ansible-deploy"
+install_self
+prepare_env_file
 REPO_DIR="$(find_repo_dir)"
 import_existing_vars
 collect_input
-install_base
-setup_swap
 
+STEP_TOTAL=9
+[ "$NEED_XRAY" != yes ] || STEP_TOTAL=10
+run_step "Системные пакеты" install_base
+run_step "Swap" setup_swap
 if [ "$NEED_XRAY" = yes ]; then
-    setup_xray
-    setup_proxy
+    run_step "Xray-прокси" setup_xray_and_proxy
 else
-    echo "Пропускаем настройку Xray. Прокси не будет использован."
     unset http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY
 fi
-
-install_docker
-install_ansible
-clone_playbook
-render_inventory
-setup_firewall
-install_playbook
+run_step "Docker" install_docker
+run_step "Ansible и just" install_ansible
+run_step "Плейбук matrix-docker-ansible-deploy" clone_playbook
+run_step "Конфиг vars.yml" render_inventory
+run_step "Firewall" setup_firewall
+STEP_HINT="около 30 минут, подробности: tail -f $LOG_FILE"
+run_step "Установка Matrix" install_matrix
+STEP_HINT=""
+run_step "Регистрация администратора" register_admin
 print_summary
 
 unset ADMIN_NICK ADMIN_PASS

@@ -1,11 +1,12 @@
 ---
-# ШАБЛОН. Его берёт scripts/matrix_up.sh и подставляет значения из .env (рядом со скриптом).
-# ${ПЕРЕМЕННАЯ} заменяется на значение из .env.
+# ШАБЛОН. Его берёт scripts/matrix_up.sh (команда matrix-up) и подставляет значения
+# из /etc/matrix_up/matrix.env: ${ПЕРЕМЕННАЯ} заменяется на значение оттуда.
 # Блоки между "# @XRAY_BEGIN" и "# @XRAY_END" попадают в итоговый файл только если нужен Xray.
 # Сгенерированный vars.yml можно править вручную и применять командой
 #   cd <каталог плейбука> && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start
-# Но повторный запуск matrix_up.sh пересоздаёт vars.yml из этого шаблона (прошлый файл
-# сохраняется рядом как vars.yml.bak-ДАТА), и ручные правки придётся перенести заново.
+# "sudo matrix-up --update" ручные правки сохраняет. Но переустановка (matrix-up --install или пункт
+# панели) пересоздаёт vars.yml из этого шаблона (прошлый файл сохраняется рядом как vars.yml.bak-ДАТА),
+# и ручные правки придётся перенести заново.
 
 your_ip: "${YOUR_IP}"
 
@@ -19,7 +20,9 @@ matrix_server_fqn_matrix: "${DOMAIN_MATRIX}"                # ВСТАВИТЬ �
 coturn_hostname: "${DOMAIN_COTURN}"                         # ВСТАВИТЬ свой домен для COTURN (старые звонки 1-на-1)
 matrix_element_call_hostname: "${DOMAIN_CALL}"              # ВСТАВИТЬ свой домен для Element Call (современные звонки + групповые)
 ntfy_hostname: "${DOMAIN_NTFY}"                             # ВСТАВИТЬ свой домен для NTFY (уведомления)
+# @ELEMENT_ADMIN_BEGIN
 matrix_element_admin_hostname: "${DOMAIN_ADMIN_PANEL}"      # ВСТАВИТЬ свой домен для Element Admin
+# @ELEMENT_ADMIN_END
 matrix_server_fqn_element: "${DOMAIN_WEB_CLIENT}"           # ВСТАВИТЬ свой домен для Web CLient (Element Web)
 
 
@@ -178,9 +181,10 @@ livekit_rtc_use_external_ip: true
 livekit_rtc_external_ip: "{{ your_ip }}"
 
 # Админка Ketesa (бывший synapse-admin от etke.cc), доступ: https://<домен Matrix>/synapse-admin/
-matrix_ketesa_enabled: true
-# Админка Element Admin
-matrix_element_admin_enabled: true
+# Включается и выключается в панели: sudo matrix-up
+matrix_ketesa_enabled: ${KETESA_ENABLED}
+# Админка Element Admin (на своём поддомене, нужен MAS). Включается и выключается в панели: sudo matrix-up
+matrix_element_admin_enabled: ${ELEMENT_ADMIN_ENABLED}
 
 
 # Настройка Matrix Authentication Service (MAS)
