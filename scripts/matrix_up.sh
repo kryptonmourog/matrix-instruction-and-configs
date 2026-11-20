@@ -1,5 +1,6 @@
 #!/bin/bash
-# Установка и обслуживание Matrix (matrix-docker-ansible-deploy) и, по желанию, Xray-прокси.
+# Установка и обслуживание Matrix (matrix-docker-ansible-deploy) и, по желанию, Xray-прокси
+# и моста Telegram (telegram-bridge-advanced: на этом сервере или на отдельном).
 #
 # Первый запуск: скачать и выполнить sudo ./matrix_up.sh. Скрипт копирует себя в систему,
 # дальше он доступен как команда matrix-up (или matrix_up) и открывает панель управления.
@@ -13,7 +14,7 @@
 
 set -euo pipefail
 
-RELEASE_TAG="v1.2.0"
+RELEASE_TAG="v1.3.0"
 PROJECT_URL="https://github.com/kryptonmourog/matrix-instruction-and-configs"
 RAW_ROOT="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags"
 RAW_BASE="${RAW_ROOT}/${RELEASE_TAG}"
@@ -24,6 +25,17 @@ PLAYBOOK_COMMIT="53bf00e192e971b72bb62c0d28f0d5599eb97cae"
 PLAYBOOK_VERSION="v2026.05.18.0"
 PROXY_PORT=10809
 DOCKER_BRIDGE_IP="172.17.0.1"
+# Мост Telegram: образ форка (на этом сервере) и роль для отдельного сервера, проверенные в этом релизе
+BRIDGE_IMAGE="ghcr.io/kryptonmourog/telegram-bridge-advanced:v0.2611.0-adv"
+BRIDGE_ROLE_REPO="https://github.com/kryptonmourog/telegram-bridge-advanced-ansible.git"
+BRIDGE_ROLE_TAG="v0.2611.0-adv.2"
+BRIDGE_ROLE_DIR="telegram-advanced"
+BRIDGE_SSH_KEY="/root/.ssh/matrix_up_telegram"
+BRIDGE_WSPROXY_DIR="/opt/matrix-telegram-wsproxy"
+BRIDGE_REGISTRATION="$BRIDGE_WSPROXY_DIR/registration.yaml"
+BRIDGE_REMOTE_DIR="/opt/mautrix-telegram"
+BRIDGE_BLOCK_BEGIN="# >>> matrix-up: мост Telegram"
+BRIDGE_BLOCK_END="# <<< matrix-up: мост Telegram"
 
 RED='\e[31m'
 GREEN='\e[32m'
@@ -387,7 +399,8 @@ run_step() {
 usage() {
     cat <<EOF
 Использование (после первого запуска скрипт доступен как команда matrix-up или matrix_up):
-  sudo matrix-up                 панель управления, если Matrix уже установлен; иначе установка
+  sudo matrix-up                 панель управления, если Matrix уже установлен (в ней же установка и удаление
+                                 моста Telegram); иначе установка
   sudo matrix-up --install       установка или переустановка: вопросы, параметры в $CONFIG_DIR/matrix.env,
                                  пересоздание vars.yml
   sudo matrix-up --update        обновление установленного сервера до версии плейбука из релиза ${RELEASE_TAG}:
@@ -603,8 +616,16 @@ mapping = {
     "matrix_authentication_service_config_secrets_encryption": "MAS_ENC_KEY",
     "matrix_ketesa_enabled": "KETESA_ENABLED",
     "matrix_element_admin_enabled": "ELEMENT_ADMIN_ENABLED",
+    "matrix_bridge_mautrix_telegram_api_id": "TG_API_ID",
+    "matrix_bridge_mautrix_telegram_api_hash": "TG_API_HASH",
+    "telegram_api_id": "TG_API_ID",
+    "telegram_api_hash": "TG_API_HASH",
+    "telegram_bridge_encryption_enabled": "TG_ENCRYPTION",
+    "telegram_direct_media_enabled": "TG_DIRECT_MEDIA",
+    "telegram_media_hostname": "TG_MEDIA_DOMAIN",
+    "matrix_admin": "TG_ADMIN",
 }
-toggles = {"KETESA_ENABLED", "ELEMENT_ADMIN_ENABLED"}
+toggles = {"KETESA_ENABLED", "ELEMENT_ADMIN_ENABLED", "TG_ENCRYPTION", "TG_DIRECT_MEDIA"}
 line_re = re.compile(r"""^([A-Za-z_][A-Za-z0-9_]*):\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
 found = {}
 uses_proxy = False
@@ -622,6 +643,13 @@ with open(sys.argv[1], encoding="utf-8") as f:
                 value = "true" if value.lower() in ("true", "yes", "on") else "false"
             found[mapping[key]] = value
 found["NEED_XRAY"] = "yes" if uses_proxy else "no"
+# Мост: на этом сервере (встроенная роль) или на отдельном (роль telegram-advanced)
+with open(sys.argv[1], encoding="utf-8") as f:
+    text = f.read()
+if re.search(r"^matrix_bridge_mautrix_telegram_enabled:\s*true", text, re.M):
+    found["TG_BRIDGE"] = "local"
+elif re.search(r"^telegram_api_id:\s*[1-9]", text, re.M):
+    found["TG_BRIDGE"] = "remote"
 for key, value in found.items():
     print(f"{key}\t{value}")
 PY
@@ -631,6 +659,15 @@ PY
             env_set "$key" "$value"
         fi
     done < "$imported"
+
+    # Адрес отдельного сервера моста - из inventory/hosts
+    local hosts="$REPO_DIR/inventory/hosts"
+    if [ -f "$hosts" ] && grep -qE '^\[telegram_bridge_servers\][[:space:]]*$' "$hosts"; then
+        value="$(bridge_inventory_value "$hosts" ansible_host)"
+        [ -n "$(env_get TG_HOST)" ] || [ -z "$value" ] || env_set TG_HOST "$value"
+        value="$(bridge_inventory_value "$hosts" ansible_port)"
+        [ -n "$(env_get TG_SSH_PORT)" ] || env_set TG_SSH_PORT "${value:-22}"
+    fi
 
     require_secrets_in_env "$existing"
 }
@@ -649,8 +686,10 @@ require_secrets_in_env() {
 # Порядок вопросов. VLESS_LINK задаётся только при Xray; логин и пароль админа в .env не пишутся.
 QUESTIONS=(YOUR_IP DOMAIN DOMAIN_MATRIX DOMAIN_WEB_CLIENT KETESA_ENABLED ELEMENT_ADMIN_ENABLED DOMAIN_ADMIN_PANEL
     DOMAIN_COTURN DOMAIN_CALL DOMAIN_NTFY
-    ADMIN_EMAIL NEED_XRAY VLESS_LINK ADMIN_NICK ADMIN_PASS)
-SUBDOMAINS=(DOMAIN_MATRIX DOMAIN_WEB_CLIENT DOMAIN_ADMIN_PANEL DOMAIN_COTURN DOMAIN_CALL DOMAIN_NTFY)
+    ADMIN_EMAIL NEED_XRAY VLESS_LINK
+    TG_BRIDGE TG_API_ID TG_API_HASH TG_HOST TG_SSH_PORT TG_ENCRYPTION TG_DIRECT_MEDIA TG_MEDIA_DOMAIN TG_ADMIN
+    ADMIN_NICK ADMIN_PASS)
+SUBDOMAINS=(DOMAIN_MATRIX DOMAIN_WEB_CLIENT DOMAIN_ADMIN_PANEL DOMAIN_COTURN DOMAIN_CALL DOMAIN_NTFY TG_MEDIA_DOMAIN)
 # Поля, уже показанные в этом запуске: при возврате назад и движении вперёд они спрашиваются снова
 declare -A ASKED_FIELDS=()
 ADMIN_NICK=""
@@ -661,6 +700,12 @@ VLESS_LINK=""
 KETESA_ENABLED=""
 ELEMENT_ADMIN_ENABLED=""
 DOMAIN_ADMIN_PANEL=""
+# Значения задаются через ask (printf -v) и читаются по имени в field_value
+# shellcheck disable=SC2034
+TG_BRIDGE=none TG_API_ID="" TG_API_HASH="" TG_HOST="" TG_SSH_PORT=22 TG_ENCRYPTION=false TG_DIRECT_MEDIA=false TG_MEDIA_DOMAIN="" TG_ADMIN=""
+TG_ADMIN_DEFAULT=""
+# yes - вопросы только о мосте (пункт панели): тогда спрашивается и администратор моста
+BRIDGE_ONLY=no
 
 field_label() {
     case "$1" in
@@ -679,13 +724,24 @@ field_label() {
         VLESS_LINK) echo "Ссылка vless://" ;;
         ADMIN_NICK) echo "Логин админа" ;;
         ADMIN_PASS) echo "Пароль админа" ;;
+        TG_BRIDGE) echo "Мост Telegram" ;;
+        TG_API_ID) echo "Telegram api_id" ;;
+        TG_API_HASH) echo "Telegram api_hash" ;;
+        TG_HOST) echo "Сервер моста" ;;
+        TG_SSH_PORT) echo "SSH-порт сервера моста" ;;
+        TG_ENCRYPTION) echo "Шифрование личных чатов" ;;
+        TG_DIRECT_MEDIA) echo "Прямые медиа" ;;
+        TG_MEDIA_DOMAIN) echo "Домен прямых медиа" ;;
+        TG_ADMIN) echo "Администратор моста" ;;
     esac
 }
 
 field_value() {
     case "$1" in
         NEED_XRAY) if [ "$NEED_XRAY" = yes ]; then echo "да"; else echo "нет"; fi ;;
-        KETESA_ENABLED | ELEMENT_ADMIN_ENABLED) if [ "${!1}" = true ]; then echo "да"; else echo "нет"; fi ;;
+        KETESA_ENABLED | ELEMENT_ADMIN_ENABLED | TG_ENCRYPTION | TG_DIRECT_MEDIA) if [ "${!1}" = true ]; then echo "да"; else echo "нет"; fi ;;
+        TG_BRIDGE) bridge_mode_label "$TG_BRIDGE" ;;
+        TG_API_HASH) echo "задан" ;;
         VLESS_LINK) if [ "${#VLESS_LINK}" -gt 40 ]; then echo "${VLESS_LINK:0:40}…"; else echo "$VLESS_LINK"; fi ;;
         ADMIN_PASS) if [ "$ADMIN_PASS_GENERATED" = yes ]; then echo "будет сгенерирован"; else echo "задан"; fi ;;
         *) echo "${!1}" ;;
@@ -697,10 +753,11 @@ detect_ip() {
     ip -4 route get 1.1.1.1 2> /dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1
 }
 
-# ask ПЕРЕМЕННАЯ "вопрос" проверка [нормализация] [по умолчанию] -> 0 / 2 (назад)
+# ask ПЕРЕМЕННАЯ "вопрос" проверка [нормализация] [по умолчанию] [mask] -> 0 / 2 (назад)
 # Значение из .env не спрашивается, если поле ещё не показывалось в этом запуске.
+# mask - после ответа показать «задан» вместо значения.
 ask() {
-    local var="$1" prompt="$2" check="$3" normalize="${4:-}" default="${5:-}" value rc
+    local var="$1" prompt="$2" check="$3" normalize="${4:-}" default="${5:-}" mask="${6:-}" value rc
     value="$(env_get "$var")"
     if [ -n "$value" ] && [ -z "${ASKED_FIELDS[$var]:-}" ]; then
         printf -v "$var" '%s' "$value"
@@ -722,7 +779,11 @@ ask() {
     done
     env_set "$var" "$value"
     printf -v "$var" '%s' "$value"
-    ui_answer "$(field_label "$var")" "$value"
+    if [ -n "$mask" ]; then
+        ui_answer "$(field_label "$var")" "задан"
+    else
+        ui_answer "$(field_label "$var")" "$value"
+    fi
 }
 
 back_hint() {
@@ -768,7 +829,13 @@ field_applicable() {
     case "$1" in
         VLESS_LINK) [ "$NEED_XRAY" = yes ] ;;
         DOMAIN_ADMIN_PANEL) [ "$ELEMENT_ADMIN_ENABLED" = true ] ;;
-        *) return 0 ;;
+        TG_API_ID | TG_API_HASH | TG_ENCRYPTION) [ "$TG_BRIDGE" = local ] || [ "$TG_BRIDGE" = remote ] ;;
+        TG_HOST | TG_SSH_PORT | TG_DIRECT_MEDIA) [ "$TG_BRIDGE" = remote ] ;;
+        TG_MEDIA_DOMAIN) [ "$TG_BRIDGE" = remote ] && [ "$TG_DIRECT_MEDIA" = true ] ;;
+        TG_ADMIN) [ "$BRIDGE_ONLY" = yes ] && { [ "$TG_BRIDGE" = local ] || [ "$TG_BRIDGE" = remote ]; } ;;
+        # В панели спрашивается только мост
+        TG_BRIDGE) return 0 ;;
+        *) [ "$BRIDGE_ONLY" != yes ] ;;
     esac
 }
 
@@ -866,6 +933,39 @@ ask_field() {
             ;;
         ADMIN_NICK) ask_admin_nick ;;
         ADMIN_PASS) ask_admin_pass ;;
+        TG_BRIDGE) ask_bridge_mode ;;
+        TG_API_ID)
+            field_applicable TG_API_ID || return "$SKIP"
+            ask TG_API_ID "Telegram api_id (со страницы https://my.telegram.org/apps)" is_api_id normalize_token
+            ;;
+        TG_API_HASH)
+            field_applicable TG_API_HASH || return "$SKIP"
+            ask TG_API_HASH "Telegram api_hash (там же, 32 символа)" is_api_hash normalize_token "" mask
+            ;;
+        TG_HOST)
+            field_applicable TG_HOST || return "$SKIP"
+            ask TG_HOST "IP или домен сервера моста (не этот сервер; Telegram должен быть доступен с него)" is_bridge_host normalize_domain
+            ;;
+        TG_SSH_PORT)
+            field_applicable TG_SSH_PORT || return "$SKIP"
+            ask TG_SSH_PORT "SSH-порт сервера моста" is_port "" 22
+            ;;
+        TG_ENCRYPTION)
+            field_applicable TG_ENCRYPTION || return "$SKIP"
+            ask_toggle TG_ENCRYPTION "Шифровать новые личные чаты Telegram в Matrix? (Element будет предупреждать, что подпись отправителя не проверена)" false
+            ;;
+        TG_DIRECT_MEDIA)
+            field_applicable TG_DIRECT_MEDIA || return "$SKIP"
+            ask_toggle TG_DIRECT_MEDIA "Прямые медиа: файлы каналов не копировать в Synapse, а отдавать по запросу? Нужен отдельный поддомен" false
+            ;;
+        TG_MEDIA_DOMAIN)
+            field_applicable TG_MEDIA_DOMAIN || return "$SKIP"
+            ask TG_MEDIA_DOMAIN "Поддомен прямых медиа (DNS-запись на ЭТОТ сервер Matrix)" is_domain normalize_domain "tm.$DOMAIN"
+            ;;
+        TG_ADMIN)
+            field_applicable TG_ADMIN || return "$SKIP"
+            ask TG_ADMIN "Администратор моста (Matrix ID, меняет настройки общих комнат)" is_matrix_id "" "$TG_ADMIN_DEFAULT"
+            ;;
     esac
 }
 
@@ -922,9 +1022,9 @@ show_answers() {
     ui_table "${rows[@]}"
 }
 
-# Экран проверки: 0 начать, 2 назад к последнему вопросу
+# Экран проверки: 0 начать, 2 назад к последнему вопросу. review_answers ["подпись кнопки начала"]
 review_answers() {
-    local fields=() f i choice rc
+    local fields=() f i choice rc start="${1:-Начать установку}"
     while true; do
         ui_section "Проверьте параметры"
         if [ "$UI" = gum ]; then show_answers; else show_answers numbered; fi
@@ -932,7 +1032,7 @@ review_answers() {
 
         if [ "$UI" = gum ]; then
             rc=0
-            choice="$("$GUM" choose --header "Всё верно?" -- "Начать установку" "Исправить значение" "← Назад")" || rc=$?
+            choice="$("$GUM" choose --header "Всё верно?" -- "$start" "Исправить значение" "← Назад")" || rc=$?
             case "$rc" in
                 0) ;;
                 1)
@@ -942,7 +1042,7 @@ review_answers() {
                 *) cancel_input ;;
             esac
             case "$choice" in
-                "Начать установку") return 0 ;;
+                "$start") return 0 ;;
                 "← Назад") return "$BACK" ;;
             esac
             local labels=()
@@ -956,7 +1056,7 @@ review_answers() {
                 [ "${labels[$i]}" != "$choice" ] || f="${fields[$i]}"
             done
         else
-            read -r -p "Enter — начать установку, номер — исправить, < — назад: " choice || die "ввод закончился, а ответы ещё нужны"
+            read -r -p "Enter — ${start,,}, номер — исправить, < — назад: " choice || die "ввод закончился, а ответы ещё нужны"
             [ -n "$choice" ] || return 0
             [ "$choice" != "<" ] || return "$BACK"
             if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#fields[@]}" ]; then
@@ -975,20 +1075,20 @@ edit_field() {
     ASKED_FIELDS[$f]=1
     ask_field "$f" || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq "$BACK" ] || exit "$rc"
-    # Включили Xray - нужна ссылка; включили Element Admin - нужен поддомен
-    local need=""
-    if [ "$f" = NEED_XRAY ] && [ "$NEED_XRAY" = yes ] && [ -z "$(env_get VLESS_LINK)" ]; then
-        need=VLESS_LINK
-    elif [ "$f" = ELEMENT_ADMIN_ENABLED ] && [ "$ELEMENT_ADMIN_ENABLED" = true ] && [ -z "$(env_get DOMAIN_ADMIN_PANEL)" ]; then
-        need=DOMAIN_ADMIN_PANEL
-    fi
-    if [ -n "$need" ]; then
+    # Изменение могло сделать нужными новые вопросы (включили Xray - нужна ссылка, выбрали мост -
+    # нужны его параметры): задаём те, на которые ещё нет ответа
+    local need
+    for need in "${QUESTIONS[@]}"; do
+        case "$need" in ADMIN_NICK | ADMIN_PASS) continue ;; esac
+        field_applicable "$need" || continue
+        [ -z "$(env_get "$need")" ] || continue
+        ASKED_FIELDS[$need]=1
         while true; do
             rc=0
             ask_field "$need" || rc=$?
             [ "$rc" -eq "$BACK" ] || break
         done
-    fi
+    done
 }
 
 collect_input() {
@@ -1010,6 +1110,15 @@ collect_input() {
         # Назад с экрана проверки - к последнему вопросу
         run_questions "$((${#QUESTIONS[@]} - 1))"
     done
+
+    if [ "$TG_BRIDGE" = remote ] && ! ensure_bridge_ssh; then
+        TG_BRIDGE=none
+        env_set TG_BRIDGE none
+        warn "мост Telegram не будет установлен: нет доступа к серверу моста по SSH. Его можно поставить позже в панели: sudo matrix-up"
+    fi
+    if [ "$TG_BRIDGE" != remote ] && [ -d "$BRIDGE_WSPROXY_DIR" ]; then
+        warn "на сервере есть мост Telegram на отдельном сервере ($BRIDGE_WSPROXY_DIR), а vars.yml пересоздаётся из шаблона: его подключение к Synapse пропадёт. Чтобы сохранить мост, прервите установку (Ctrl+C) и выберите в вопросе о мосте «На отдельном сервере»"
+    fi
 
     # Секреты: генерируются один раз, потом берутся из .env
     ensure_secret GENERIC_SECRET
@@ -1257,6 +1366,12 @@ with open(out_path, "w", encoding="utf-8") as f:
     f.write(text)
 PY
     chmod 600 "$out"
+
+    # Мост Telegram: блок настроек в vars.yml и сервер моста в inventory
+    if [ "$TG_BRIDGE" = local ] || [ "$TG_BRIDGE" = remote ]; then
+        BRIDGE_VARS_FILE="$out"
+        bridge_prepare_vars
+    fi
 }
 
 # ---------- шаг 6: firewall ----------
@@ -1345,6 +1460,7 @@ print_summary() {
         "Логин админа" "$ADMIN_NICK" \
         "Пароль админа" "$pass_shown" \
         "Xray" "$(if [ "$NEED_XRAY" = yes ]; then echo /usr/local/etc/xray/config.json; else echo "не используется"; fi)" \
+        "Мост Telegram" "$(bridge_summary_text)" \
         "Конфиг ansible" "$config" \
         "Параметры и секреты" "$ENV_FILE (не теряйте)"
     note "Применить ручные правки vars.yml: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-all,start"
@@ -1355,6 +1471,739 @@ print_summary() {
         warn "администратор $ADMIN_NICK не зарегистрирован. Если такой пользователь уже был, его пароль остался прежним. Другая частая причина: MAS счёл пароль слишком простым."
         note "Зарегистрировать вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --extra-vars='username=ЛОГИН password=ПАРОЛЬ admin=yes' --tags=register-user"
     fi
+}
+
+# ---------- мост Telegram (telegram-bridge-advanced) ----------
+#
+# Два варианта:
+#   local  - на этом сервере, встроенной ролью плейбука с образом форка;
+#   remote - на отдельном сервере, ролью telegram-bridge-advanced-ansible (папка telegram-advanced в каталоге
+#            плейбука, группа [telegram_bridge_servers] в inventory/hosts). Мост сам подключается к этому
+#            серверу через wsproxy; скрипт заходит на тот сервер по SSH ключом BRIDGE_SSH_KEY.
+# Настройки моста пишутся в vars.yml отдельным блоком между BRIDGE_BLOCK_BEGIN и BRIDGE_BLOCK_END,
+# поэтому установка и удаление работают и с vars.yml, созданным прошлыми версиями скрипта.
+
+# ask_bridge_mode -> 0 / 2 (назад). Значение: none | local | remote
+ask_bridge_mode() {
+    local value rc=0 choice header labels=() i def_label
+    value="$(env_get TG_BRIDGE)"
+    if [ -n "$value" ] && [ -z "${ASKED_FIELDS[TG_BRIDGE]:-}" ]; then
+        TG_BRIDGE="$value"
+        return 0
+    fi
+    # Ответы не с клавиатуры: вопрос не задаётся, чтобы не сдвинуть ответы
+    if [ ! -t 0 ] && [ -z "$value" ]; then
+        TG_BRIDGE=none
+        env_set TG_BRIDGE none
+        return 0
+    fi
+    ASKED_FIELDS[TG_BRIDGE]=1
+    header="Установить мост Telegram (telegram-bridge-advanced)?"
+    if [ "$NEED_XRAY" = yes ]; then
+        header+=$'\n  На этом сервере — мост ходит в Telegram через Xray.'
+    else
+        header+=$'\n  На этом сервере — Telegram должен открываться с этого сервера.'
+    fi
+    header+=$'\n  На отдельном сервере — зарубежный VPS, нужен вход на него по SSH под root.'
+    for i in none local remote; do labels+=("$(bridge_mode_label "$i")"); done
+    def_label="$(bridge_mode_label "${value:-none}")"
+    if [ "$UI" = gum ]; then
+        choice="$("$GUM" choose --header "$header" --selected "$def_label" -- "${labels[@]}" "← Назад")" || rc=$?
+        case "$rc" in
+            0) ;;
+            1)
+                clear_gum_line
+                return "$BACK"
+                ;;
+            *) cancel_input ;;
+        esac
+        [ "$choice" != "← Назад" ] || return "$BACK"
+    else
+        printf '%s\n' "$header" >&9
+        for i in "${!labels[@]}"; do printf '  %d. %s\n' "$((i + 1))" "${labels[$i]}" >&9; done
+        while true; do
+            read -r -p "Номер [$def_label, < — назад]: " choice || die "ввод закончился, а ответы ещё нужны"
+            [ "$choice" != "<" ] || return "$BACK"
+            if [ -z "$choice" ]; then
+                choice="$def_label"
+                break
+            fi
+            if [[ "$choice" =~ ^[1-3]$ ]]; then
+                choice="${labels[$((choice - 1))]}"
+                break
+            fi
+            ui_invalid "Нет такого пункта."
+        done
+    fi
+    for i in none local remote; do
+        [ "$(bridge_mode_label "$i")" != "$choice" ] || TG_BRIDGE="$i"
+    done
+    env_set TG_BRIDGE "$TG_BRIDGE"
+    ui_answer "Мост Telegram" "$choice"
+}
+
+bridge_mode_label() {
+    case "$1" in
+        local) echo "На этом сервере" ;;
+        remote) echo "На отдельном сервере" ;;
+        *) echo "Не ставить" ;;
+    esac
+}
+
+is_api_id() { [[ "$1" =~ ^[1-9][0-9]{2,11}$ ]]; }
+is_api_hash() { [[ "$1" =~ ^[0-9a-f]{32}$ ]]; }
+is_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+is_matrix_id() { [[ "$1" =~ ^@[a-z0-9._=/+-]+:[a-z0-9.-]+(:[0-9]+)?$ ]]; }
+# Сервер моста - не этот же сервер
+is_bridge_host() {
+    [ "$1" != "${YOUR_IP:-}" ] || return 1
+    is_ipv4 "$1" || is_domain "$1"
+}
+normalize_token() {
+    local v="${1,,}"
+    printf '%s' "${v//[[:space:]]/}"
+}
+
+# Что уже стоит: BRIDGE_KIND none | local | remote | manual, BRIDGE_FLAVOR advanced | original, BRIDGE_HOST.
+# manual - wsproxy на этом сервере есть, а мост на отдельном сервере ставился не скриптом и не ролью.
+BRIDGE_KIND=none
+BRIDGE_FLAVOR=""
+BRIDGE_HOST=""
+bridge_detect() {
+    local cfg="$1" hosts image
+    hosts="$(dirname "$(dirname "$(dirname "$cfg")")")/hosts"
+    BRIDGE_KIND=none BRIDGE_FLAVOR="" BRIDGE_HOST=""
+    if [ "$(yaml_value "$cfg" matrix_bridge_mautrix_telegram_enabled)" = true ]; then
+        BRIDGE_KIND=local
+        image="$(yaml_value "$cfg" matrix_bridge_mautrix_telegram_container_image) $(yaml_value "$cfg" matrix_bridge_mautrix_telegram_container_image_self_build_repo)"
+        if [[ "$image" == *telegram-bridge-advanced* ]]; then BRIDGE_FLAVOR=advanced; else BRIDGE_FLAVOR=original; fi
+    elif [ -f "$hosts" ] && grep -qE '^\[telegram_bridge_servers\][[:space:]]*$' "$hosts"; then
+        BRIDGE_KIND=remote BRIDGE_FLAVOR=advanced
+        BRIDGE_HOST="$(bridge_inventory_value "$hosts" ansible_host)"
+    elif [ -d "$BRIDGE_WSPROXY_DIR" ]; then
+        BRIDGE_KIND=manual
+    fi
+}
+
+# bridge_inventory_value hosts ключ - значение ключа у хоста группы [telegram_bridge_servers]
+# (ansible_host без значения - имя хоста)
+bridge_inventory_value() {
+    awk -v key="$2" '
+        /^\[/ { f = ($0 ~ /^\[telegram_bridge_servers\]/); next }
+        f && NF && $1 !~ /^[#;]/ {
+            for (i = 2; i <= NF; i++) if (index($i, key "=") == 1) { print substr($i, length(key) + 2); exit }
+            if (key == "ansible_host") print $1
+            exit
+        }' "$1"
+}
+
+bridge_status_text() {
+    case "$BRIDGE_KIND" in
+        local)
+            local state
+            state="$(systemctl is-active matrix-mautrix-telegram 2> /dev/null || true)"
+            if [ "$BRIDGE_FLAVOR" = advanced ]; then
+                echo "на этом сервере, telegram-bridge-advanced (${state:-?})"
+            else
+                echo "на этом сервере, оригинальный mautrix-telegram (${state:-?})"
+            fi
+            ;;
+        remote) echo "на отдельном сервере ${BRIDGE_HOST:-?}" ;;
+        manual) echo "на отдельном сервере, установлен вручную" ;;
+        *) echo "не установлен" ;;
+    esac
+}
+
+bridge_ssh() {
+    ssh -i "$BRIDGE_SSH_KEY" -p "$TG_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=accept-new "root@$TG_HOST" "$@"
+}
+
+# Доступ на сервер моста по SSH. Интерактивно, до шагов со спиннером.
+# 0 - доступ есть, 1 - пользователь отказался.
+ensure_bridge_ssh() {
+    local choice rc
+    if [ ! -f "$BRIDGE_SSH_KEY" ]; then
+        install -d -m 700 "$(dirname "$BRIDGE_SSH_KEY")"
+        ssh-keygen -q -t ed25519 -N "" -C "matrix-up@$(hostname)" -f "$BRIDGE_SSH_KEY" \
+            || die "не удалось создать SSH-ключ $BRIDGE_SSH_KEY"
+    fi
+    while ! bridge_ssh true < /dev/null > /dev/null 2>&1; do
+        ui_section "Доступ к серверу моста $TG_HOST"
+        note "Скрипт заходит на сервер моста по SSH под root этим ключом. Добавьте его на $TG_HOST"
+        note "в /root/.ssh/authorized_keys, например командой на том сервере:"
+        printf "\n  echo '%s' >> /root/.ssh/authorized_keys\n\n" "$(cat "$BRIDGE_SSH_KEY.pub")" >&9
+        [ -t 0 ] || die "нет доступа по SSH к root@$TG_HOST (порт $TG_SSH_PORT). Добавьте ключ выше и запустите скрипт снова"
+        rc=0
+        choice="$(ui_menu "Как продолжить?" \
+            "Проверить снова" \
+            "Скопировать ключ, введя пароль root от $TG_HOST" \
+            "Не ставить мост")" || rc=$?
+        [ "$rc" -eq 0 ] || choice="Не ставить мост"
+        case "$choice" in
+            "Скопировать ключ"*)
+                ssh-copy-id -i "$BRIDGE_SSH_KEY.pub" -p "$TG_SSH_PORT" -o StrictHostKeyChecking=accept-new \
+                    "root@$TG_HOST" < /dev/tty > /dev/tty 2>&1 || ui_invalid "Скопировать ключ не удалось."
+                ;;
+            "Не ставить мост") return 1 ;;
+        esac
+    done
+    ui_answer "SSH до сервера моста" "root@$TG_HOST, порт $TG_SSH_PORT"
+}
+
+# Свои комнаты каналов у каждого пользователя включаются только у нового моста: у работающего
+# существующие комнаты каналов не переезжают, и рядом появились бы новые. Результат в TG_PERSONAL_CHANNELS.
+TG_PERSONAL_CHANNELS=true
+bridge_detect_personal() {
+    local state
+    if [ "$TG_BRIDGE" = local ]; then
+        if [ -f /matrix/mautrix-telegram/config/config.yaml ]; then
+            state=false
+            grep -qE '^[[:space:]]*personal_channels:[[:space:]]*true' /matrix/mautrix-telegram/config/config.yaml && state=true
+        else
+            state=new
+        fi
+    else
+        state="$(bridge_ssh "if [ -f $BRIDGE_REMOTE_DIR/data/config.yaml ]; then
+            grep -qE '^[[:space:]]*personal_channels:[[:space:]]*true' $BRIDGE_REMOTE_DIR/data/config.yaml && echo true || echo false
+            else echo new; fi" < /dev/null)" || die "не удалось проверить мост на $TG_HOST по SSH"
+    fi
+    case "$state" in
+        new) TG_PERSONAL_CHANNELS=true ;;
+        true) TG_PERSONAL_CHANNELS=true ;;
+        *)
+            TG_PERSONAL_CHANNELS=false
+            note "Мост уже работал, поэтому комнаты каналов остаются общими (свои комнаты у каждого — только у нового моста)"
+            ;;
+    esac
+}
+
+# bridge_inventory hosts set|remove - группа [telegram_bridge_servers] в inventory/hosts
+bridge_inventory() {
+    python3 - "$1" "$2" "${TG_HOST:-}" "${TG_SSH_PORT:-22}" "$BRIDGE_SSH_KEY" <<'PY' || die "не удалось изменить $1"
+import sys
+
+path, mode, host, port, key = sys.argv[1:6]
+with open(path, encoding="utf-8") as f:
+    lines = f.read().splitlines()
+out, skip = [], False
+for line in lines:
+    s = line.strip()
+    if s.startswith("[") and s.endswith("]"):
+        skip = s == "[telegram_bridge_servers]"
+        if skip:
+            continue
+    if not skip:
+        out.append(line)
+while out and not out[-1].strip():
+    out.pop()
+if mode == "set":
+    out += ["", "[telegram_bridge_servers]",
+            f"telegram-bridge ansible_host={host} ansible_port={port} ansible_user=root ansible_ssh_private_key_file={key}"]
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+PY
+}
+
+# bridge_write_vars vars.yml local|remote|none [synapse] - блок настроек моста в vars.yml.
+# Ключ, уже заданный вне блока одной строкой, меняется на месте; многострочный - конфликт (остановка).
+# none убирает блок. synapse - подключить регистрацию моста к Synapse (только когда файл уже есть).
+bridge_write_vars() {
+    local admin="${TG_ADMIN:-}"
+    [ -n "$admin" ] || admin="@${ADMIN_NICK:-admin}:$DOMAIN"
+    python3 - "$1" "$2" "${3:-}" "$ENV_FILE" "$BRIDGE_IMAGE" "${NEED_XRAY:-no}" "$TG_PERSONAL_CHANNELS" "$admin" \
+        "$BRIDGE_BLOCK_BEGIN" "$BRIDGE_BLOCK_END" "$DOCKER_BRIDGE_IP" <<'PY' || die "не удалось записать настройки моста в $1"
+import json
+import re
+import sys
+
+(path, mode, synapse, env_path, image, need_xray, personal, admin,
+ begin, end, docker_ip) = sys.argv[1:12]
+
+env = {}
+with open(env_path, encoding="utf-8") as f:
+    for line in f:
+        m = re.match(r'^([A-Z_][A-Z0-9_]*)="(.*)"$', line.rstrip("\n"))
+        if m:
+            env[m.group(1)] = m.group(2)
+
+with open(path, encoding="utf-8") as f:
+    lines = f.read().split("\n")
+out, inside = [], False
+for line in lines:
+    if line.strip() == begin:
+        inside = True
+        continue
+    if line.strip() == end:
+        inside = False
+        continue
+    if not inside:
+        out.append(line)
+while out and not out[-1].strip():
+    out.pop()
+
+key_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(.*)$")
+top = {}
+for i, line in enumerate(out):
+    m = key_re.match(line)
+    if m:
+        top[m.group(1)] = i
+
+
+def section(key):
+    """Text of a top-level key with its indented continuation."""
+    i = top[key]
+    j = i + 1
+    while j < len(out) and (not out[j].strip() or out[j][0] in " \t#-"):
+        j += 1
+    return "\n".join(out[i:j])
+
+
+q = json.dumps
+yes = lambda v: "true" if v in ("true", "yes") else "false"
+entries = []  # (key, single-line value or None, text)
+
+
+def scalar(key, value):
+    entries.append((key, value, f"{key}: {value}"))
+
+
+def multi(key, text):
+    entries.append((key, None, text))
+
+
+skip_outside = {"matrix_admin"}
+enc = env.get("TG_ENCRYPTION") == "true"
+if mode == "local":
+    ext = [
+        "bridge:",
+        "  tag_only_on_create: false",
+        "  mute_only_on_create: false",
+        "network:",
+        "  folder_spaces:",
+        "    enabled: true",
+        "    default_language: ru",
+        "  matrix_request_timeout: 3h",
+        "  backfill_split_media_mb: 10",
+        "  extev_polls: true",
+        "  sync:",
+        "    update_limit: -1",
+        "    create_limit: -1",
+        "  max_member_count: 1000",
+        f"  personal_channels: {yes(personal)}",
+        "  max_initial_messages_override: {user: 300, saved: 1000}",
+        "  comment_poll: {on_read_seconds: 60, background_minutes: 15, background_hours: 24}",
+    ]
+    if need_xray == "yes":
+        ext += ["  proxy:", "    type: socks5", f'    address: "{docker_ip}:10808"']
+    ext += ["backfill:", "  enabled: true", "  max_initial_messages: 30"]
+    if enc:
+        ext += ["encryption:", "  personal: true"]
+    scalar("matrix_bridge_mautrix_telegram_enabled", "true")
+    scalar("matrix_bridge_mautrix_telegram_api_id", env["TG_API_ID"])
+    scalar("matrix_bridge_mautrix_telegram_api_hash", q(env["TG_API_HASH"]))
+    scalar("matrix_bridge_mautrix_telegram_container_image", q(image))
+    scalar("matrix_bridge_mautrix_telegram_bridge_personal_filtering_spaces", "false")
+    scalar("matrix_appservice_double_puppet_enabled", "true")
+    scalar("matrix_admin", q(admin))
+    if enc:
+        scalar("matrix_bridges_encryption_enabled", "true")
+    multi("matrix_bridge_mautrix_telegram_configuration_extension_yaml",
+          "matrix_bridge_mautrix_telegram_configuration_extension_yaml: |\n" + "\n".join("  " + l for l in ext))
+elif mode == "remote":
+    scalar("telegram_api_id", env["TG_API_ID"])
+    scalar("telegram_api_hash", q(env["TG_API_HASH"]))
+    scalar("telegram_bridge_language", "ru")
+    scalar("telegram_bridge_encryption_enabled", yes(env.get("TG_ENCRYPTION", "false")))
+    scalar("telegram_bridge_personal_channels", yes(personal))
+    direct = env.get("TG_DIRECT_MEDIA") == "true"
+    scalar("telegram_direct_media_enabled", yes(env.get("TG_DIRECT_MEDIA", "false")))
+    if direct:
+        scalar("telegram_media_hostname", q(env["TG_MEDIA_DOMAIN"]))
+    scalar("matrix_appservice_double_puppet_enabled", "true")
+    scalar("matrix_admin", q(admin))
+    if synapse:
+        wired = "matrix_synapse_app_service_config_files" in top and \
+            "/matrix-telegram-registration.yaml" in section("matrix_synapse_app_service_config_files")
+        if not wired:
+            multi("matrix_synapse_container_additional_volumes",
+                  "matrix_synapse_container_additional_volumes:\n"
+                  "  - src: /opt/matrix-telegram-wsproxy/registration.yaml\n"
+                  "    dst: /matrix-telegram-registration.yaml\n"
+                  "    options: ro")
+            multi("matrix_synapse_app_service_config_files",
+                  "matrix_synapse_app_service_config_files:\n  - /matrix-telegram-registration.yaml")
+        if enc:
+            scalar("matrix_synapse_experimental_features_msc2409_to_device_messages_enabled", "true")
+            scalar("matrix_synapse_experimental_features_msc3202_transaction_extensions_enabled", "true")
+
+block, conflicts, changed = [], [], []
+for key, value, text in entries:
+    if key not in top:
+        block.append(text)
+        continue
+    if key in skip_outside:
+        continue
+    current = key_re.match(out[top[key]]).group(2).split("#")[0].strip()
+    if value is not None and current and current[0] not in "|>":
+        out[top[key]] = text
+        changed.append(key)
+    else:
+        conflicts.append(key)
+if conflicts:
+    sys.exit("в vars.yml уже есть многострочные настройки, которые скрипт не может объединить сам: "
+             + ", ".join(conflicts) + ". Уберите их из vars.yml и повторите (нужное из них потом можно вернуть"
+             + " ниже блока моста, объединив со значением из блока)")
+
+text = "\n".join(out) + "\n"
+if block:
+    text += ("\n" + begin + "\n"
+             + "# Блок пишет matrix-up (мост Telegram). Правки внутри перезапишутся при переустановке моста.\n"
+             + "\n".join(block) + "\n" + end + "\n")
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+for key in changed:
+    print(f"изменено вне блока: {key}")
+PY
+}
+
+# Отключение моста в vars.yml: убирает блок, у встроенной роли выключает мост, а регистрацию
+# отдельного моста убирает из списков Synapse (в том числе вписанную вручную).
+bridge_unwire_vars() {
+    python3 - "$1" "$BRIDGE_BLOCK_BEGIN" "$BRIDGE_BLOCK_END" <<'PY' || die "не удалось изменить $1"
+import re
+import sys
+
+path, begin, end = sys.argv[1:4]
+with open(path, encoding="utf-8") as f:
+    lines = f.read().split("\n")
+out, inside = [], False
+for line in lines:
+    if line.strip() == begin:
+        inside = True
+        continue
+    if line.strip() == end:
+        inside = False
+        continue
+    if not inside:
+        out.append(line)
+
+key_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(.*)$")
+markers = ("matrix-telegram-registration", "/opt/matrix-telegram-wsproxy/registration.yaml")
+lists = {"matrix_synapse_container_extra_arguments", "matrix_synapse_container_additional_volumes",
+         "matrix_synapse_app_service_config_files"}
+result, i = [], 0
+while i < len(out):
+    line = out[i]
+    m = key_re.match(line)
+    if m and m.group(1) == "matrix_bridge_mautrix_telegram_enabled":
+        result.append("matrix_bridge_mautrix_telegram_enabled: false")
+        i += 1
+        continue
+    if not (m and m.group(1) in lists and not m.group(2).split("#")[0].strip()):
+        result.append(line)
+        i += 1
+        continue
+    # Список: элементы начинаются с "- ", продолжение элемента - строки с большим отступом
+    j = i + 1
+    body = []
+    while j < len(out) and (not out[j].strip() or out[j][0] in " \t#-"):
+        body.append(out[j])
+        j += 1
+    items, current, kept_lines = [], None, []
+    for b in body:
+        stripped = b.lstrip()
+        if stripped.startswith("- "):
+            current = [b]
+            items.append(current)
+        elif current is not None and b.strip() and not stripped.startswith("#") \
+                and len(b) - len(stripped) > len(current[0]) - len(current[0].lstrip()):
+            current.append(b)
+        else:
+            current = None
+            items.append([b])
+    kept = [it for it in items if not (it[0].lstrip().startswith("- ") and any(mk in "\n".join(it) for mk in markers))]
+    removed = len(kept) != len(items)
+    if removed and not any(it[0].lstrip().startswith("- ") for it in kept):
+        # Список опустел: ключ убирается целиком (пустой ключ - это null, а не пустой список)
+        result.extend(l for it in kept for l in it if not l.strip() or l.lstrip().startswith("#"))
+    else:
+        result.append(line)
+        result.extend(l for it in kept for l in it)
+    i = j
+while result and not result[-1].strip():
+    result.pop()
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(result) + "\n")
+PY
+}
+
+# Строки vars.yml, которые всё ещё подключают регистрацию отдельного моста к Synapse
+bridge_synapse_wired() {
+    grep -nE 'matrix-telegram-registration|/opt/matrix-telegram-wsproxy/registration\.yaml' "$1"
+}
+
+# Роль telegram-bridge-advanced-ansible в $REPO_DIR/telegram-advanced, версия BRIDGE_ROLE_TAG.
+# Более новую версию, уже лежащую там, не откатывает.
+bridge_fetch_role() {
+    local dir="$REPO_DIR/$BRIDGE_ROLE_DIR"
+    if [ ! -d "$dir/.git" ]; then
+        [ ! -e "$dir" ] || die "$dir существует, но это не git-репозиторий. Переименуйте его и запустите скрипт снова"
+        run_with_retry "rm -rf '$dir.partial' && git clone -q '$BRIDGE_ROLE_REPO' '$dir.partial'" 5
+        mv "$dir.partial" "$dir"
+    else
+        run_with_retry "git -C '$dir' fetch -q --tags origin" 5
+    fi
+    if git -C "$dir" merge-base --is-ancestor "$BRIDGE_ROLE_TAG" HEAD 2> /dev/null \
+        && [ "$(git -C "$dir" rev-parse HEAD)" != "$(git -C "$dir" rev-parse "$BRIDGE_ROLE_TAG^{commit}")" ]; then
+        note "Роль моста новее $BRIDGE_ROLE_TAG, оставлена как есть"
+    else
+        git -C "$dir" checkout -q "$BRIDGE_ROLE_TAG" \
+            || die "не удалось переключить $dir на $BRIDGE_ROLE_TAG: там есть локальные изменения"
+        note "Роль моста: $BRIDGE_ROLE_TAG"
+    fi
+}
+
+bridge_run_site() {
+    run_with_retry "ansible-playbook -i inventory/hosts $BRIDGE_ROLE_DIR/site.yml" 3 \
+        || die "установка моста не удалась. Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts $BRIDGE_ROLE_DIR/site.yml"
+}
+
+bridge_run_synapse() {
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=setup-synapse,start" 3 \
+        || die "не удалось применить настройки Synapse. Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=setup-synapse,start"
+}
+
+# Подключает регистрацию отдельного моста к Synapse, если она ещё не подключена
+bridge_connect_synapse() {
+    local file="$1"
+    [ -s "$BRIDGE_REGISTRATION" ] || die "мост не создал регистрацию $BRIDGE_REGISTRATION"
+    bridge_write_vars "$file" remote synapse
+    bridge_run_synapse
+}
+
+bridge_verify() {
+    if ansible-playbook -i inventory/hosts "$BRIDGE_ROLE_DIR/verify.yml"; then
+        note "Мост и wsproxy работают"
+    else
+        warn "проверка моста нашла остановленные контейнеры, подробности в журнале"
+    fi
+}
+
+# Двойной вход (matrix-appservice-double-puppet) нужен до установки отдельного моста
+bridge_double_puppet() {
+    if [ -s /matrix/appservice-double-puppet/config/registration.yaml ]; then
+        note "Двойной вход уже включён"
+        return 0
+    fi
+    apply_install_all
+}
+
+apply_install_all() {
+    run_with_retry "ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start" 3 \
+        || die "плейбук завершился с ошибкой. Прошлый vars.yml сохранён рядом как vars.yml.bak-ДАТА.
+Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts setup.yml --tags=install-all,start"
+}
+
+bridge_summary_text() {
+    case "$TG_BRIDGE" in
+        local) echo "на этом сервере: напишите «login qr» боту @telegrambot:$DOMAIN" ;;
+        remote) echo "на $TG_HOST: напишите «login qr» боту @telegrambot:$DOMAIN" ;;
+        *) echo "не установлен" ;;
+    esac
+}
+
+# Значения для вопросов о мосте в панели: из файла параметров, иначе из vars.yml
+bridge_panel_context() {
+    local cfg="$1" hosts
+    hosts="$REPO_DIR/inventory/hosts"
+    DOMAIN="$(yaml_value "$cfg" matrix_domain)"
+    DOMAIN_MATRIX="$(yaml_value "$cfg" matrix_server_fqn_matrix)"
+    YOUR_IP="$(yaml_value "$cfg" your_ip)"
+    NEED_XRAY=no
+    grep -qE '^your_proxy_http_proxy:[[:space:]]*[^[:space:]]' "$cfg" && NEED_XRAY=yes
+    local key value
+    for key in TG_API_ID:matrix_bridge_mautrix_telegram_api_id TG_API_HASH:matrix_bridge_mautrix_telegram_api_hash \
+        TG_API_ID:telegram_api_id TG_API_HASH:telegram_api_hash; do
+        value="$(yaml_value "$cfg" "${key#*:}")"
+        if [ -n "$value" ] && [[ "$value" != *"{{"* ]] && [ -z "$(env_get "${key%%:*}")" ]; then
+            env_set "${key%%:*}" "$value"
+        fi
+    done
+    if [ -z "$(env_get TG_ADMIN)" ]; then
+        value="$(yaml_value "$cfg" matrix_admin)"
+        is_matrix_id "$value" || value="@admin:$DOMAIN"
+        TG_ADMIN_DEFAULT="$value"
+    fi
+    if [ -f "$hosts" ] && [ -z "$(env_get TG_HOST)" ]; then
+        value="$(bridge_inventory_value "$hosts" ansible_host)"
+        [ -z "$value" ] || env_set TG_HOST "$value"
+    fi
+}
+
+# Пункт панели: установить мост (new), подключить установленный вручную (adopt),
+# перевести оригинальный mautrix-telegram на форк (upgrade)
+panel_bridge_install() {
+    local how="$1" rc=0 saved_questions=("${QUESTIONS[@]}")
+    find_single_config
+    REPO_DIR="$(find_repo_dir)"
+    prepare_env_file
+    bridge_panel_context "$PANEL_CONFIG"
+    BRIDGE_ONLY=yes
+    ASKED_FIELDS=()
+    case "$how" in
+        new) ASKED_FIELDS[TG_BRIDGE]=1 ;;
+        adopt) env_set TG_BRIDGE remote ;;
+        upgrade) env_set TG_BRIDGE local ;;
+    esac
+    QUESTIONS=(TG_BRIDGE TG_API_ID TG_API_HASH TG_HOST TG_SSH_PORT TG_ENCRYPTION TG_DIRECT_MEDIA TG_MEDIA_DOMAIN TG_ADMIN)
+    ui_clear
+    case "$how" in
+        new) ui_banner "Matrix · мост Telegram" "telegram-bridge-advanced: папки, комментарии, опросы и другое" ;;
+        adopt) ui_banner "Matrix · мост Telegram" "подключение моста, установленного вручную: его база и вход в Telegram сохранятся" ;;
+        upgrade) ui_banner "Matrix · мост Telegram" "переход с mautrix-telegram на telegram-bridge-advanced: база и вход в Telegram сохранятся" ;;
+    esac
+    run_questions 0
+    if [ "$TG_BRIDGE" = none ]; then
+        QUESTIONS=("${saved_questions[@]}")
+        return 0
+    fi
+    while true; do
+        rc=0
+        review_answers "Начать" || rc=$?
+        [ "$rc" -eq "$BACK" ] || break
+        run_questions "$((${#QUESTIONS[@]} - 1))"
+    done
+    QUESTIONS=("${saved_questions[@]}")
+    TG_ADMIN="$(env_get TG_ADMIN)"
+    if [ "$TG_BRIDGE" = remote ] && ! ensure_bridge_ssh; then
+        PANEL_MSG="Мост не установлен: нет доступа к серверу моста по SSH"
+        return 0
+    fi
+
+    cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
+    load_proxy_env
+    BRIDGE_VARS_FILE="$PANEL_CONFIG"
+    STEP_NO=0
+    if [ "$TG_BRIDGE" = local ]; then
+        STEP_TOTAL=2
+        run_step "Настройки моста в vars.yml" bridge_prepare_vars
+        STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
+        run_step "Установка моста (плейбук)" apply_install_all
+        STEP_HINT=""
+    else
+        STEP_TOTAL=6
+        run_step "Роль моста" bridge_fetch_role
+        run_step "Настройки моста в vars.yml и inventory" bridge_prepare_vars
+        STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
+        run_step "Двойной вход" bridge_double_puppet
+        run_step "Установка моста на $TG_HOST" bridge_run_site
+        run_step "Подключение моста к Synapse" bridge_connect_synapse "$PANEL_CONFIG"
+        STEP_HINT=""
+        run_step "Проверка" bridge_verify
+    fi
+    PANEL_MSG="Мост Telegram установлен: $(bridge_summary_text)"
+}
+
+# Шаг: копия vars.yml, проверка существующего моста, блок настроек, inventory
+BRIDGE_VARS_FILE=""
+bridge_prepare_vars() {
+    local backup
+    if [ "$MODE" != install ]; then
+        backup="$BRIDGE_VARS_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+        cp -p "$BRIDGE_VARS_FILE" "$backup"
+        note "Прошлый vars.yml сохранён: $backup"
+    fi
+    bridge_detect_personal
+    if [ "$TG_BRIDGE" = remote ]; then
+        bridge_inventory "$REPO_DIR/inventory/hosts" set
+        # Регистрация уже есть (переустановка или ручная установка) - Synapse подключается сразу
+        if [ -s "$BRIDGE_REGISTRATION" ]; then
+            bridge_write_vars "$BRIDGE_VARS_FILE" remote synapse
+        else
+            bridge_write_vars "$BRIDGE_VARS_FILE" remote
+        fi
+    else
+        bridge_write_vars "$BRIDGE_VARS_FILE" local
+    fi
+}
+
+# Пункт панели: удалить мост (любой из найденных bridge_detect)
+panel_bridge_remove() {
+    local rc=0 keep=yes text wired
+    find_single_config
+    REPO_DIR="$(find_repo_dir)"
+    bridge_detect "$PANEL_CONFIG"
+    case "$BRIDGE_KIND" in
+        local) text="Удалить мост Telegram с этого сервера? Комнаты в Matrix останутся, данные моста (/matrix/mautrix-telegram, база в Postgres) — тоже, их можно удалить следующим вопросом." ;;
+        remote) text="Удалить мост Telegram с ${BRIDGE_HOST:-сервера моста} и wsproxy с этого сервера? Комнаты в Matrix останутся." ;;
+        manual) text="Отключить мост Telegram, установленный вручную: убрать его регистрацию из Synapse и wsproxy с этого сервера? Сам мост на его сервере остановите вручную (docker compose down в его каталоге). Комнаты в Matrix останутся." ;;
+        *)
+            PANEL_MSG="Мост Telegram не найден"
+            return 0
+            ;;
+    esac
+    ui_yes_no "$text" no || rc=$?
+    [ "$rc" -eq 0 ] || return 0
+    if [ "$BRIDGE_KIND" = remote ]; then
+        rc=0
+        ui_yes_no "Оставить на ${BRIDGE_HOST:-сервере моста} базу моста ($BRIDGE_REMOTE_DIR: вход в Telegram, связи комнат)? Без неё повторная установка начнёт заново." yes || rc=$?
+        case "$rc" in
+            0) keep=yes ;;
+            1) keep=no ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    cd "$REPO_DIR" || die "директория $REPO_DIR недоступна"
+    load_proxy_env
+    prepare_env_file
+    ui_clear
+    ui_banner "Matrix · удаление моста Telegram" "$(bridge_status_text)"
+    STEP_NO=0
+    cp -p "$PANEL_CONFIG" "$PANEL_CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+    bridge_unwire_vars "$PANEL_CONFIG"
+    if wired="$(bridge_synapse_wired "$PANEL_CONFIG")"; then
+        die "регистрацию моста не удалось убрать из $PANEL_CONFIG автоматически, строки:
+$wired
+Уберите их вручную и повторите удаление (прошлый vars.yml сохранён рядом как vars.yml.bak-ДАТА)"
+    fi
+    STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
+    if [ "$BRIDGE_KIND" = local ]; then
+        STEP_TOTAL=1
+        run_step "Удаление моста (плейбук)" apply_setup_all
+        STEP_HINT=""
+        rc=0
+        ui_yes_no "Удалить и данные моста (/matrix/mautrix-telegram)? Вход в Telegram и связи комнат пропадут, повторная установка начнёт заново." no || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rm -rf /matrix/mautrix-telegram
+            note "Данные моста удалены. База matrix_mautrix_telegram в Postgres осталась, она не мешает."
+        fi
+    else
+        STEP_TOTAL=3
+        run_step "Отключение моста от Synapse" bridge_run_synapse
+        STEP_HINT=""
+        run_step "Роль моста" bridge_fetch_role
+        run_step "Удаление моста и wsproxy" bridge_run_uninstall "$keep"
+        bridge_inventory "$REPO_DIR/inventory/hosts" remove
+        rm -rf "${REPO_DIR:?}/$BRIDGE_ROLE_DIR"
+    fi
+    env_set TG_BRIDGE none
+    PANEL_MSG="Мост Telegram удалён. Двойной вход (matrix_appservice_double_puppet_enabled) оставлен включённым."
+    [ "$keep" = no ] || [ "$BRIDGE_KIND" != remote ] || PANEL_MSG+=" База моста осталась на ${BRIDGE_HOST:-его сервере} в $BRIDGE_REMOTE_DIR."
+}
+
+bridge_run_uninstall() {
+    local keep=true
+    [ "$1" = yes ] || keep=false
+    run_with_retry "ansible-playbook -i inventory/hosts $BRIDGE_ROLE_DIR/uninstall.yml -e telegram_uninstall_keep_data=$keep" 3 \
+        || die "удаление не завершилось. Повторить вручную: cd $REPO_DIR && sudo ansible-playbook -i inventory/hosts $BRIDGE_ROLE_DIR/uninstall.yml"
+}
+
+# Обновление: отдельный мост обновляется вместе с Matrix (роль и образ своей версии)
+bridge_update_steps() {
+    run_step "Роль моста" bridge_fetch_role
+    run_step "Обновление моста на ${BRIDGE_HOST:-сервере моста}" bridge_run_site
 }
 
 # ---------- системная команда и параметры ----------
@@ -1452,6 +2301,7 @@ panel_status() {
     disk="$(df -h / | awk 'NR == 2 {print $3 " из " $2 " (" $5 ")"}')"
     repo="$(find_repo_dir)"
     find_single_config
+    bridge_detect "$PANEL_CONFIG"
     local ketesa element_admin fqn
     fqn="$(yaml_value "$PANEL_CONFIG" matrix_server_fqn_matrix)"
     if [ "$(yaml_value "$PANEL_CONFIG" matrix_ketesa_enabled)" = true ]; then
@@ -1472,6 +2322,7 @@ panel_status() {
         "Xray" "${xray:-неизвестно}" \
         "Ketesa" "$ketesa" \
         "Element Admin" "$element_admin" \
+        "Мост Telegram" "$(bridge_status_text)" \
         "Диск /" "$disk" \
         "Плейбук" "$repo ($(git -C "$repo" rev-parse --short HEAD 2> /dev/null || echo "?"))" \
         "Скрипт" "$RELEASE_TAG"
@@ -1605,7 +2456,7 @@ admin_menu_label() {
 
 # Панель перерисовывается целиком при каждом показе меню: заголовок, состояние, сообщение, меню
 run_panel() {
-    local choice rc server_name ketesa_item element_admin_item
+    local choice rc server_name ketesa_item element_admin_item bridge_items
     server_name="$(sed -n 's/^matrix_server_fqn_matrix:[[:space:]]*"\{0,1\}\([^" #]*\).*/\1/p' "$(find_repo_dir)"/inventory/host_vars/*/vars.yml 2> /dev/null | head -1)"
     while true; do
         ui_clear
@@ -1618,11 +2469,25 @@ run_panel() {
         rc=0
         ketesa_item="$(admin_menu_label matrix_ketesa_enabled "Ketesa")"
         element_admin_item="$(admin_menu_label matrix_element_admin_enabled "Element Admin")"
+        # bridge_detect уже вызван в panel_status
+        case "$BRIDGE_KIND" in
+            none) bridge_items=("Установить мост Telegram") ;;
+            manual) bridge_items=("Подключить мост Telegram к matrix-up" "Удалить мост Telegram") ;;
+            local)
+                if [ "$BRIDGE_FLAVOR" = original ]; then
+                    bridge_items=("Перевести мост Telegram на telegram-bridge-advanced" "Удалить мост Telegram")
+                else
+                    bridge_items=("Удалить мост Telegram")
+                fi
+                ;;
+            *) bridge_items=("Удалить мост Telegram") ;;
+        esac
         choice="$(ui_menu "Что сделать?" \
             "Обновить состояние" \
             "Обновить Matrix" \
             "$ketesa_item" \
             "$element_admin_item" \
+            "${bridge_items[@]}" \
             "Изменить параметры и переустановить" \
             "Журнал последней установки" \
             "Выход")" || rc=$?
@@ -1632,6 +2497,10 @@ run_panel() {
             *"админку Ketesa") panel_toggle ketesa ;;
             *"админку Element Admin") panel_toggle element_admin ;;
             "Обновить Matrix") panel_exec --update ;;
+            "Установить мост Telegram") panel_bridge_install new ;;
+            "Подключить мост Telegram к matrix-up") panel_bridge_install adopt ;;
+            "Перевести мост Telegram на telegram-bridge-advanced") panel_bridge_install upgrade ;;
+            "Удалить мост Telegram") panel_bridge_remove ;;
             "Изменить параметры и переустановить") panel_exec --install ;;
             "Журнал последней установки") panel_log ;;
             *) exit 0 ;;
@@ -1743,19 +2612,23 @@ run_update() {
         command -v "$cmd" > /dev/null || die "не найдена команда $cmd. Запустите скрипт без --update, он доустановит недостающее"
     done
     UPDATE_CONFIG="${configs[0]}"
+    bridge_detect "$UPDATE_CONFIG"
 
     STEP_TOTAL=3
+    [ "$BRIDGE_KIND" != remote ] || STEP_TOTAL=5
     run_step "Плейбук и роли" clone_playbook
     run_step "Версия плейбука в vars.yml" bump_validated_version "$UPDATE_CONFIG"
     STEP_HINT="до 30 минут, подробности: tail -f $LOG_FILE"
     run_step "Обновление Matrix" update_matrix
+    [ "$BRIDGE_KIND" != remote ] || bridge_update_steps
     STEP_HINT=""
 
     ui_section "Обновление завершено!"
     ui_table \
         "Плейбук" "$REPO_DIR" \
         "Версия" "$PLAYBOOK_VERSION (коммит $(git -C "$REPO_DIR" rev-parse --short HEAD))" \
-        "Конфиг" "$UPDATE_CONFIG"
+        "Конфиг" "$UPDATE_CONFIG" \
+        "Мост Telegram" "$(bridge_status_text)"
 }
 
 # ---------- главный сценарий ----------
@@ -1790,7 +2663,8 @@ import_existing_vars
 collect_input
 
 STEP_TOTAL=9
-[ "$NEED_XRAY" != yes ] || STEP_TOTAL=10
+[ "$NEED_XRAY" != yes ] || STEP_TOTAL=$((STEP_TOTAL + 1))
+[ "$TG_BRIDGE" != remote ] || STEP_TOTAL=$((STEP_TOTAL + 4))
 run_step "Системные пакеты" install_base
 run_step "Swap" setup_swap
 if [ "$NEED_XRAY" = yes ]; then
@@ -1807,6 +2681,18 @@ STEP_HINT="около 30 минут, подробности: tail -f $LOG_FILE"
 run_step "Установка Matrix" install_matrix
 STEP_HINT=""
 run_step "Регистрация администратора" register_admin
+if [ "$TG_BRIDGE" = remote ]; then
+    run_step "Роль моста Telegram" bridge_fetch_role
+    STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
+    run_step "Установка моста на $TG_HOST" bridge_run_site
+    if bridge_synapse_wired "$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml" > /dev/null; then
+        run_step "Подключение моста к Synapse" note "Synapse уже подключён к мосту"
+    else
+        run_step "Подключение моста к Synapse" bridge_connect_synapse "$REPO_DIR/inventory/host_vars/$DOMAIN_MATRIX/vars.yml"
+    fi
+    STEP_HINT=""
+    run_step "Проверка моста" bridge_verify
+fi
 print_summary
 
 unset ADMIN_NICK ADMIN_PASS
