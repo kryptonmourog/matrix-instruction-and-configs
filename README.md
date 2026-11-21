@@ -21,7 +21,7 @@ curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-c
 
 Потом любую из них можно установить или удалить в панели `sudo matrix-up`: скрипт меняет одну строку в `vars.yml` (с бэкапом) и применяет плейбук.
 
-**Мост Telegram** ([telegram-bridge-advanced](https://github.com/kryptonmourog/telegram-bridge-advanced) — форк mautrix-telegram: папки как пространства, комментарии, опросы и другое). Установщик спрашивает, ставить ли его и где:
+**Мост Telegram** ([telegram-bridge-advanced](https://github.com/kryptonmourog/telegram-bridge-advanced) — мой форк mautrix-telegram: папки как пространства, комментарии, опросы и другое). Установщик спрашивает, ставить ли его и где:
 - **На этом сервере** — встроенной ролью плейбука с образом форка. Telegram должен открываться с сервера; если стоит Xray, мост ходит в Telegram через него (SOCKS5).
 - **На отдельном сервере** — зарубежный VPS, если Telegram с сервера Matrix недоступен. Мост ставит роль [telegram-bridge-advanced-ansible](https://github.com/kryptonmourog/telegram-bridge-advanced-ansible) (кладётся в каталог плейбука как `telegram-advanced`), мост сам подключается к серверу Matrix через wsproxy, новых портов не нужно. Скрипт заходит на VPS по SSH под root своим ключом `/root/.ssh/matrix_up_telegram`: открытый ключ он покажет, добавить его можно вручную или вводом пароля root от VPS. По желанию — прямые медиа (отдельный поддомен на сервер Matrix).
 
@@ -49,11 +49,11 @@ curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-c
 
 Список версий и изменений: [Releases](https://github.com/kryptonmourog/matrix-instruction-and-configs/releases).
 
-Видео-инструкция:
+Видео-инструкция (старая версия скрипта, до v1.0.0 в нынешней нумерации версий):
 https://www.youtube.com/watch?v=GGaM5asQGxE
 
 
-## Полный гайд
+## Гайд по полу-ручной установке через ansible-playbook
 Моя инструкция:
 https://docs.google.com/document/d/1Dox26X0Rt3AuAhWyyuIXTLwvM6RRhxVPvqRuELNR2ws
 

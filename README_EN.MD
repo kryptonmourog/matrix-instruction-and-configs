@@ -18,7 +18,7 @@ After the first run the script installs itself, and from then on it is available
 
 Either one can be installed or removed later from the `sudo matrix-up` panel: the script changes one line in `vars.yml` (with a backup) and applies the playbook.
 
-**Telegram bridge** ([telegram-bridge-advanced](https://github.com/kryptonmourog/telegram-bridge-advanced), a fork of mautrix-telegram: folders as spaces, comments, polls and more). The installer asks whether to install it and where:
+**Telegram bridge** ([telegram-bridge-advanced](https://github.com/kryptonmourog/telegram-bridge-advanced), my fork of mautrix-telegram: folders as spaces, comments, polls and more). The installer asks whether to install it and where:
 - **On this server**, with the playbook's built-in role and the fork's image. Telegram must be reachable from the server; with Xray the bridge reaches Telegram through it (SOCKS5).
 - **On a separate server**, a VPS abroad, when Telegram isn't reachable from the Matrix server. The bridge is installed by [telegram-bridge-advanced-ansible](https://github.com/kryptonmourog/telegram-bridge-advanced-ansible) (placed in the playbook directory as `telegram-advanced`); the bridge connects to the Matrix server itself through wsproxy, no new ports are needed. The script logs in to the VPS over SSH as root with its own key `/root/.ssh/matrix_up_telegram`: it shows the public key, which you add by hand or by typing the VPS root password. Optionally, direct media (a separate subdomain pointing to the Matrix server).
 
@@ -46,11 +46,11 @@ First, `--update` checks whether a newer release of the script with the same maj
 
 Versions and changes: [Releases](https://github.com/kryptonmourog/matrix-instruction-and-configs/releases).
 
-Video instruction:
+Video instruction (an old version of the script, from before v1.0.0 in the current version numbering):
 [https://www.youtube.com/watch?v=GGaM5asQGxE](https://www.youtube.com/watch?v=GGaM5asQGxE)
 
 
-## Full Guide [Russian Language]
+## Semi-manual installation guide using ansible-playbook [Russian language]
 My instruction:
 [https://docs.google.com/document/d/1Dox26X0Rt3AuAhWyyuIXTLwvM6RRhxVPvqRuELNR2ws](https://docs.google.com/document/d/1Dox26X0Rt3AuAhWyyuIXTLwvM6RRhxVPvqRuELNR2ws)
 
