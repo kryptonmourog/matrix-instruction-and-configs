@@ -12,7 +12,7 @@ your_ip: "${YOUR_IP}"
 
 # @XRAY_BEGIN
 your_proxy_http_proxy: "http://172.17.0.1:10809"
-your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-livekit-server,matrix-authentication-service,matrix-postgres,172.16.0.0/12"
+your_proxy_no_proxy: "localhost,127.0.0.1,{{ matrix_domain }},.{{ matrix_domain }},matrix-synapse,matrix-livekit-server,matrix-authentication-service,matrix-postgres,matrix-mautrix-telegram,matrix-telegram-wsproxy,172.16.0.0/12"
 # @XRAY_END
 
 matrix_domain: "${DOMAIN}"                                  # ВСТАВИТЬ свой ОСНОВНОЙ ДОМЕН

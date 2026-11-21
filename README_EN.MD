@@ -26,6 +26,8 @@ The following questions depend on the choice: `api_id` and `api_hash` from [my.t
 
 In the `sudo matrix-up` panel the bridge can be installed on a running server (including one installed by earlier versions of the script), removed (the built-in mautrix-telegram, original or the fork, and a bridge on a separate server; Matrix rooms stay, the bridge database can be kept), the original mautrix-telegram can be switched to the fork keeping its database and login, and a bridge installed on a separate server by hand (wsproxy on the Matrix server) can be taken over by the script. `--update` updates the bridge on a separate server too.
 
+When an encrypted bridge returns to a server where the bot still has cross-signing keys from another database, a local installation automatically replaces the unavailable old key. For a bridge on a separate server, the role cannot detect this before the first start. If such a bridge exits with `Failed to verify with recovery key`, replace the `recovery_key` value in its database with `overwrite` and restart the bridge.
+
 Answers and generated secrets are stored in `/etc/matrix_up/matrix.env`, so a reinstall only asks for the admin login and password and keeps the database password and keys. The `.env` file that earlier versions kept next to the script is moved there automatically. If the server already has an installation (including one made by earlier versions of the script), its domains and secrets are imported automatically too. The script prompts are in Russian.
 
 **Updating an existing server** (including one installed by earlier versions of the script):

@@ -1838,6 +1838,17 @@ elif mode == "remote":
             scalar("matrix_synapse_experimental_features_msc3202_transaction_extensions_enabled", "true")
 
 block, conflicts, changed = [], [], []
+# Synapse uses the Xray HTTP proxy for outbound traffic. The local bridge (or wsproxy for a remote bridge)
+# must bypass it, otherwise Synapse sends local appservice requests through the proxy and gets HTTP 503.
+local_peer = "matrix-mautrix-telegram" if mode == "local" else "matrix-telegram-wsproxy"
+if need_xray == "yes" and "your_proxy_no_proxy" in top:
+    i = top["your_proxy_no_proxy"]
+    if local_peer not in out[i]:
+        m = re.match(r"""^(your_proxy_no_proxy:\s*["']?)(.*?)(["']?\s*(#.*)?)$""", out[i])
+        if not m or not m.group(2):
+            sys.exit(f"не удалось дописать {local_peer} в your_proxy_no_proxy в vars.yml")
+        out[i] = m.group(1) + m.group(2) + "," + local_peer + m.group(3)
+        changed.append("your_proxy_no_proxy")
 for key, value, text in entries:
     if key not in top:
         block.append(text)
@@ -1990,6 +2001,41 @@ bridge_verify() {
     fi
 }
 
+# Verify that a local bridge stays up. The playbook can otherwise observe it during a short interval between
+# crash-loop restarts and report it as running.
+bridge_check_local() {
+    local unit=matrix-mautrix-telegram before after attempt
+    for attempt in 1 2; do
+        before="$(systemctl show -p NRestarts --value "$unit" 2> /dev/null || echo 0)"
+        sleep 60
+        after="$(systemctl show -p NRestarts --value "$unit" 2> /dev/null || echo 0)"
+        if systemctl is-active --quiet "$unit" && [ "$before" = "$after" ]; then
+            note "Мост работает"
+            return 0
+        fi
+        # The bot's cross-signing keys on the server don't match the database: it has no key (a bridge
+        # whose database is gone) or an old one (the bridge ran elsewhere meanwhile). The key that fits is
+        # lost, so let the bridge make new ones
+        [ "$attempt" = 1 ] && journalctl -u "$unit" -n 50 --no-pager 2> /dev/null \
+            | grep -qE "Server already has cross-signing keys, but no key in database|Failed to verify with recovery key" || break
+        bridge_local_overwrite_keys || break
+        note "Ключи подписи бота на сервере остались от прошлой установки моста, мост создаст новые"
+        systemctl restart "$unit" || break
+    done
+    journalctl -u "$unit" -n 30 --no-pager || true
+    warn "мост Telegram не запускается или перезапускается (последние строки его журнала — в журнале установки). Подробнее: journalctl -u $unit"
+}
+
+bridge_local_overwrite_keys() {
+    local sql="INSERT INTO kv_store (bridge_id, key, value) VALUES ('', 'recovery_key', 'overwrite') ON CONFLICT (bridge_id, key) DO UPDATE SET value = 'overwrite'"
+    if [ -f /matrix/mautrix-telegram/data/mautrix-telegram.db ]; then
+        python3 -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1], timeout=30); db.execute(sys.argv[2]); db.commit()' \
+            /matrix/mautrix-telegram/data/mautrix-telegram.db "$sql" >> "$LOG_FILE" 2>&1
+    else
+        docker exec matrix-postgres sh -c "psql -U \"\$POSTGRES_USER\" -d matrix_mautrix_telegram -qc \"$sql\"" >> "$LOG_FILE" 2>&1
+    fi
+}
+
 # Двойной вход (matrix-appservice-double-puppet) нужен до установки отдельного моста
 bridge_double_puppet() {
     if [ -s /matrix/appservice-double-puppet/config/registration.yaml ]; then
@@ -2086,11 +2132,12 @@ panel_bridge_install() {
     BRIDGE_VARS_FILE="$PANEL_CONFIG"
     STEP_NO=0
     if [ "$TG_BRIDGE" = local ]; then
-        STEP_TOTAL=2
+        STEP_TOTAL=3
         run_step "Настройки моста в vars.yml" bridge_prepare_vars
         STEP_HINT="10–20 минут, подробности: tail -f $LOG_FILE"
         run_step "Установка моста (плейбук)" apply_install_all
         STEP_HINT=""
+        run_step "Проверка моста" bridge_check_local
     else
         STEP_TOTAL=6
         run_step "Роль моста" bridge_fetch_role
@@ -2177,7 +2224,12 @@ $wired
         ui_yes_no "Удалить и данные моста (/matrix/mautrix-telegram)? Вход в Telegram и связи комнат пропадут, повторная установка начнёт заново." no || rc=$?
         if [ "$rc" -eq 0 ]; then
             rm -rf /matrix/mautrix-telegram
-            note "Данные моста удалены. База matrix_mautrix_telegram в Postgres осталась, она не мешает."
+            # With Postgres the logins and the bot's encryption key live in its database, not in the directory
+            if docker ps --format '{{.Names}}' 2> /dev/null | grep -qx matrix-postgres; then
+                docker exec matrix-postgres sh -c 'psql -U "$POSTGRES_USER" -d postgres -qc "DROP DATABASE IF EXISTS matrix_mautrix_telegram WITH (FORCE)"' >> "$LOG_FILE" 2>&1 \
+                    || warn "базу matrix_mautrix_telegram в Postgres удалить не удалось, подробности в $LOG_FILE"
+            fi
+            note "Данные моста удалены"
         fi
     else
         STEP_TOTAL=3
@@ -2201,6 +2253,31 @@ bridge_run_uninstall() {
 }
 
 # Обновление: отдельный мост обновляется вместе с Matrix (роль и образ своей версии)
+# Synapse behind Xray must reach the bridge or wsproxy directly. Installations created before this fix only
+# listed the core Matrix services in your_proxy_no_proxy.
+bridge_ensure_no_proxy() {
+    local file="$1" peer=matrix-mautrix-telegram
+    [ "$BRIDGE_KIND" = local ] || peer=matrix-telegram-wsproxy
+    grep -q '^your_proxy_no_proxy:' "$file" || return 0
+    grep '^your_proxy_no_proxy:' "$file" | grep -qF "$peer" && return 0
+    local rc=0
+    python3 - "$file" "$peer" << 'PYEOF' || rc=$?
+import re, sys
+path, peer = sys.argv[1:3]
+lines = open(path, encoding="utf-8").read().split("\n")
+for i, line in enumerate(lines):
+    m = re.match(r"""^(your_proxy_no_proxy:\s*["']?)(.*?)(["']?\s*(#.*)?)$""", line)
+    if m and m.group(2):
+        lines[i] = m.group(1) + m.group(2) + "," + peer + m.group(3)
+        break
+else:
+    sys.exit(1)
+open(path, "w", encoding="utf-8").write("\n".join(lines))
+PYEOF
+    [ "$rc" -eq 0 ] && note "В your_proxy_no_proxy добавлен $peer" \
+        || warn "не удалось добавить $peer в your_proxy_no_proxy в $file, добавьте вручную"
+}
+
 bridge_update_steps() {
     run_step "Роль моста" bridge_fetch_role
     run_step "Обновление моста на ${BRIDGE_HOST:-сервере моста}" bridge_run_site
@@ -2618,6 +2695,7 @@ run_update() {
     [ "$BRIDGE_KIND" != remote ] || STEP_TOTAL=5
     run_step "Плейбук и роли" clone_playbook
     run_step "Версия плейбука в vars.yml" bump_validated_version "$UPDATE_CONFIG"
+    case "$BRIDGE_KIND" in local | remote) bridge_ensure_no_proxy "$UPDATE_CONFIG" ;; esac
     STEP_HINT="до 30 минут, подробности: tail -f $LOG_FILE"
     run_step "Обновление Matrix" update_matrix
     [ "$BRIDGE_KIND" != remote ] || bridge_update_steps
@@ -2665,6 +2743,7 @@ collect_input
 STEP_TOTAL=9
 [ "$NEED_XRAY" != yes ] || STEP_TOTAL=$((STEP_TOTAL + 1))
 [ "$TG_BRIDGE" != remote ] || STEP_TOTAL=$((STEP_TOTAL + 4))
+[ "$TG_BRIDGE" != local ] || STEP_TOTAL=$((STEP_TOTAL + 1))
 run_step "Системные пакеты" install_base
 run_step "Swap" setup_swap
 if [ "$NEED_XRAY" = yes ]; then
@@ -2693,6 +2772,7 @@ if [ "$TG_BRIDGE" = remote ]; then
     STEP_HINT=""
     run_step "Проверка моста" bridge_verify
 fi
+[ "$TG_BRIDGE" != local ] || run_step "Проверка моста" bridge_check_local
 print_summary
 
 unset ADMIN_NICK ADMIN_PASS
