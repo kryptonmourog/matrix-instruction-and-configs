@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-RELEASE_TAG="v1.3.0"
+RELEASE_TAG="v1.3.1"
 PROJECT_URL="https://github.com/kryptonmourog/matrix-instruction-and-configs"
 RAW_ROOT="https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags"
 RAW_BASE="${RAW_ROOT}/${RELEASE_TAG}"
@@ -813,6 +813,8 @@ ask_domain() {
             value="$(env_get "$var")"
             if [ -n "$value" ] && [ "${value%."$old"}" != "$value" ]; then
                 env_set "$var" "${value%."$old"}.$DOMAIN"
+                # Переменная в памяти тоже: иначе экран проверки и установка возьмут старый поддомен
+                printf -v "$var" '%s' "${value%."$old"}.$DOMAIN"
             fi
         done
     fi
@@ -1083,23 +1085,41 @@ review_answers() {
 
 # Исправление одного поля с экрана проверки. "Назад" здесь просто возвращает к экрану.
 edit_field() {
-    local f="$1" rc=0
+    local f="$1" rc need
     ASKED_FIELDS[$f]=1
-    ask_field "$f" || rc=$?
-    [ "$rc" -eq 0 ] || [ "$rc" -eq "$BACK" ] || exit "$rc"
-    # Изменение могло сделать нужными новые вопросы (включили Xray - нужна ссылка, выбрали мост -
-    # нужны его параметры): задаём те, на которые ещё нет ответа
+    while true; do
+        rc=0
+        ask_field "$f" || rc=$?
+        [ "$rc" -eq 0 ] || [ "$rc" -eq "$BACK" ] || [ "$rc" -eq "$SKIP" ] || exit "$rc"
+        need="$(first_missing_field)"
+        [ -n "$need" ] || return 0
+        if [ "$rc" -eq "$BACK" ]; then
+            ui_invalid "Для этого значения нужны ещё ответы: ответьте на них или измените значение."
+        fi
+        # Изменение могло сделать нужными новые вопросы (включили Xray - нужна ссылка, выбрали мост -
+        # нужны его параметры): задаём те, на которые ещё нет ответа. "Назад" в них - к исправляемому полю.
+        while [ -n "$need" ]; do
+            ASKED_FIELDS[$need]=1
+            rc=0
+            ask_field "$need" || rc=$?
+            [ "$rc" -ne "$BACK" ] || break
+            [ "$rc" -eq 0 ] || [ "$rc" -eq "$SKIP" ] || exit "$rc"
+            need="$(first_missing_field)"
+        done
+        [ -n "$need" ] || return 0
+    done
+}
+
+# Первый нужный сейчас вопрос без ответа в файле параметров (логин и пароль админа туда не пишутся)
+first_missing_field() {
     local need
     for need in "${QUESTIONS[@]}"; do
         case "$need" in ADMIN_NICK | ADMIN_PASS) continue ;; esac
         field_applicable "$need" || continue
-        [ -z "$(env_get "$need")" ] || continue
-        ASKED_FIELDS[$need]=1
-        while true; do
-            rc=0
-            ask_field "$need" || rc=$?
-            [ "$rc" -eq "$BACK" ] || break
-        done
+        [ -n "$(env_get "$need")" ] || {
+            echo "$need"
+            return 0
+        }
     done
 }
 

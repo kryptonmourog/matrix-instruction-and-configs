@@ -5,7 +5,7 @@ The repository this is based on:
 ## Short Guide
 **Command to run the installation script (copy and run ON THE SERVER):**
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.1/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
 
 In a terminal the script shows a [gum](https://github.com/charmbracelet/gum) interface: one question at a time with suggested defaults (subdomains are derived from the main domain), **Esc goes back to the previous question**, and a review screen at the end lets you fix any value. Installation runs step by step with a spinner, the detailed output goes to `/var/log/matrix_up.log`, and on error the script shows the last lines of the log. gum is downloaded once (pinned version and checksum) to `/usr/local/lib/matrix_up/` and reused on later runs; it is not added to `PATH`. Without a terminal, if gum is unavailable, or with `--plain`, the script uses plain text mode; there you go back by answering `<`. When answers do not come from the keyboard (a file or another program), there is no review screen; the parameter table is just printed.
@@ -36,7 +36,7 @@ sudo matrix-up --update
 ```
 If there is no `matrix-up` command yet (the server was installed by a version before v1.2.0):
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh --update
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.1/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh --update
 ```
 The same command without `--update` opens the panel, which is how to install the Telegram bridge on a server installed by earlier versions of the script.
 

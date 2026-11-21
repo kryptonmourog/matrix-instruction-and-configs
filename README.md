@@ -8,7 +8,7 @@ https://github.com/spantaleev/matrix-docker-ansible-deploy
 
 **Команда для запуска скрипта установки (скопировать и запустить НА СЕРВЕРЕ):**
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.1/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh
 ```
 
 В терминале скрипт показывает интерфейс на [gum](https://github.com/charmbracelet/gum): вопросы по одному с подсказками по умолчанию (поддомены предлагаются от основного домена), **Esc — вернуться к предыдущему вопросу**, в конце — экран проверки, где любое значение можно исправить. Установка идёт по шагам со спиннером, а подробный вывод пишется в `/var/log/matrix_up.log`; при ошибке скрипт показывает последние строки журнала. gum скачивается один раз (версия и контрольная сумма зафиксированы) в `/usr/local/lib/matrix_up/` и используется при следующих запусках; в `PATH` он не добавляется. Без терминала, при недоступности gum или с флагом `--plain` скрипт работает в обычном текстовом режиме; там вернуться назад можно, ответив `<`. Если ответы подаются не с клавиатуры (из файла или другой программы), экран проверки не показывается, а таблица параметров просто выводится.
@@ -39,7 +39,7 @@ sudo matrix-up --update
 ```
 Если команды `matrix-up` ещё нет (сервер ставился версией до v1.2.0):
 ```bash
-curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.0/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh --update
+curl -O https://raw.githubusercontent.com/kryptonmourog/matrix-instruction-and-configs/refs/tags/v1.3.1/scripts/matrix_up.sh && chmod +x matrix_up.sh && sudo ./matrix_up.sh --update
 ```
 Та же команда без `--update` открывает панель — так можно поставить мост Telegram на сервер, установленный прошлыми версиями скрипта.
 
