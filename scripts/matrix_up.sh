@@ -54,6 +54,18 @@ GUM=""
 GUM_VERSION="2.0.2"
 GUM_SHA256_X86_64="d842e06d93dbed90af48cb8dd10698db6f22e331fc40346bb37bbc753109edc2"
 GUM_SHA256_ARM64="8ebf8b54ec1e8c81f2bb58b59ff9b70998186a4d11375f0cf357b80e0ccfa1d5"
+UI_ACCENT="#1FD7A3"
+UI_ACCENT_TEXT="#18252B"
+# Keep gum's built-in pink and purple defaults from leaking into the TUI.
+export GUM_CHOOSE_CURSOR_FOREGROUND="$UI_ACCENT"
+export GUM_CHOOSE_HEADER_FOREGROUND="$UI_ACCENT"
+export GUM_CHOOSE_SELECTED_FOREGROUND="$UI_ACCENT"
+export GUM_INPUT_PROMPT_FOREGROUND="$UI_ACCENT"
+export GUM_INPUT_CURSOR_FOREGROUND="$UI_ACCENT"
+export GUM_CONFIRM_PROMPT_FOREGROUND="$UI_ACCENT"
+export GUM_CONFIRM_SELECTED_FOREGROUND="$UI_ACCENT_TEXT"
+export GUM_CONFIRM_SELECTED_BACKGROUND="$UI_ACCENT"
+export GUM_SPIN_SPINNER_FOREGROUND="$UI_ACCENT"
 # Системная установка скрипта: команды matrix-up и matrix_up ведут на копию в INSTALL_DIR
 INSTALL_DIR="/usr/local/lib/matrix_up"
 INSTALLED_SCRIPT="$INSTALL_DIR/matrix_up.sh"
@@ -247,8 +259,8 @@ ui_banner() {
     if [ "$UI" = gum ]; then
         # Отступы - обычными переводами строки: --margin у gum рисует строки из пробелов
         printf '\n' >&9
-        "$GUM" style --border rounded --border-foreground 212 --padding "0 2" \
-            -- "$("$GUM" style --bold --foreground 212 -- "$1")" "$("$GUM" style --faint -- "$2")" >&9
+        "$GUM" style --border rounded --border-foreground "$UI_ACCENT" --padding "0 2" \
+            -- "$("$GUM" style --bold --foreground "$UI_ACCENT" -- "$1")" "$("$GUM" style --faint -- "$2")" >&9
         printf '\n' >&9
     else
         printf '\n=== %s ===\n%s\n' "$1" "$2"
@@ -258,7 +270,7 @@ ui_banner() {
 ui_section() {
     if [ "$UI" = gum ]; then
         printf '\n' >&9
-        "$GUM" style --bold --foreground 212 -- "$1" >&9
+        "$GUM" style --bold --foreground "$UI_ACCENT" -- "$1" >&9
     else
         printf '\n=== %s ===\n' "$1"
     fi
