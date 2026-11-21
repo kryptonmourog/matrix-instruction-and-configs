@@ -2028,8 +2028,10 @@ bridge_check_local() {
         # The bot's cross-signing keys on the server don't match the database: it has no key (a bridge
         # whose database is gone) or an old one (the bridge ran elsewhere meanwhile). The key that fits is
         # lost, so let the bridge make new ones
-        [ "$attempt" = 1 ] && journalctl -u "$unit" -n 50 --no-pager 2> /dev/null \
-            | grep -qE "Server already has cross-signing keys, but no key in database|Failed to verify with recovery key" || break
+        if [ "$attempt" != 1 ] || ! journalctl -u "$unit" -n 50 --no-pager 2> /dev/null \
+            | grep -qE "Server already has cross-signing keys, but no key in database|Failed to verify with recovery key"; then
+            break
+        fi
         bridge_local_overwrite_keys || break
         note "Ключи подписи бота на сервере остались от прошлой установки моста, мост создаст новые"
         systemctl restart "$unit" || break
@@ -2286,8 +2288,11 @@ else:
     sys.exit(1)
 open(path, "w", encoding="utf-8").write("\n".join(lines))
 PYEOF
-    [ "$rc" -eq 0 ] && note "В your_proxy_no_proxy добавлен $peer" \
-        || warn "не удалось добавить $peer в your_proxy_no_proxy в $file, добавьте вручную"
+    if [ "$rc" -eq 0 ]; then
+        note "В your_proxy_no_proxy добавлен $peer"
+    else
+        warn "не удалось добавить $peer в your_proxy_no_proxy в $file, добавьте вручную"
+    fi
 }
 
 bridge_update_steps() {
